@@ -96,8 +96,8 @@
     },
     {
       "path": "scripts/print-mcp-config.mjs",
-      "bytes": 735,
-      "sha256": "b2817101a9a888b3ef4bb7449ab2bf59798d2400e2b86bce3165fc7d45158302"
+      "bytes": 717,
+      "sha256": "01aaad0adad0cfb6fd00229064e14a8a2417606b4ef5183885a5887dd33ce249"
     },
     {
       "path": "scripts/verify.mjs",
