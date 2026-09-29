@@ -1,0 +1,8 @@
+node_modules/
+.glasses/
+*.sqlite*
+evidence/
+.env*
+public/app.js
+public/app.js.map
+.vercel/
