@@ -2,10 +2,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createIntelligenceStore } from './intelligence-store.mjs';
 import { searchTerms } from './store.mjs';
 import { validatePublicURL } from './discovery.mjs';
+import { measureJevClassificationBatch, isDefinitelyUnsentProviderError, ARTIFACTS, ADOPTIONS } from './providers.mjs';
+import { CLASSIFICATION_SCHEMA, CLASSIFICATION_POLICY, LEGACY_CLASSIFICATION_POLICY, classificationFingerprint } from './classification-policy.mjs';
 
-export const ARTIFACTS=['whole-product','tool-library','agent-extension','memory-engine','replacement-agent','component','pattern','reference','unknown'];
-export const ADOPTIONS=['configure-agent','deploy-service','embed-package','adapt-source','replace-workflow','reference','unknown'];
-export const INTELLIGENCE_SCHEMA='glasses-evidence-v2';
+export { ARTIFACTS, ADOPTIONS } from './providers.mjs';
+export const INTELLIGENCE_SCHEMA=CLASSIFICATION_SCHEMA;
+export const INTELLIGENCE_POLICY=CLASSIFICATION_POLICY;
 export const DEFAULT_INTELLIGENCE_SETTINGS={provider:'codex',autoClassify:false,autoResearch:false,maxCandidates:10,maxJobsPerDay:4,timeoutSeconds:180,jevDailyBudgetUsd:0.10,confidenceThreshold:0.65};
 const now=()=>new Date().toISOString(), hash=value=>createHash('sha256').update(typeof value==='string'?value:JSON.stringify(value)).digest('hex');
 const fail=(message,status=400)=>Object.assign(new Error(message),{status});
@@ -50,7 +52,7 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
   const getSettings=()=>({...settings});
   const usageToday=()=>{
     const day=now().slice(0,10),rows=db.all('usage').filter(row=>row.createdAt.startsWith(day));
-    return {day,timeZone:'UTC',jobs:db.all('jobs').filter(job=>job.createdAt.startsWith(day)).length,calls:rows.length,inputTokens:rows.reduce((n,row)=>n+(row.inputTokens||0),0),outputTokens:rows.reduce((n,row)=>n+(row.outputTokens||0),0),jevCostUsd:rows.filter(row=>row.provider==='jev').reduce((n,row)=>n+(row.costUsd??0),0),jevReservedUsd:rows.filter(row=>row.provider==='jev').reduce((n,row)=>n+(row.chargedOrReservedUsd||0),0),unknownCostCalls:rows.filter(row=>row.costUsd==null).length,note:'Codex subscription usage is not converted to API prices. Unreported Jev costs retain a conservative per-call reservation.'};
+    return {day,timeZone:'UTC',jobs:db.all('jobs').filter(job=>job.createdAt.startsWith(day)).length,calls:rows.filter(row=>row.requestSent!==false).length,localRejections:rows.filter(row=>row.requestSent===false).length,inputTokens:rows.reduce((n,row)=>n+(row.inputTokens||0),0),outputTokens:rows.reduce((n,row)=>n+(row.outputTokens||0),0),jevCostUsd:rows.filter(row=>row.provider==='jev').reduce((n,row)=>n+(row.costUsd??0),0),jevReservedUsd:rows.filter(row=>row.provider==='jev').reduce((n,row)=>n+(row.chargedOrReservedUsd||0),0),unknownCostCalls:rows.filter(row=>row.costUsd==null).length,note:'Codex subscription usage is not converted to API prices. Unreported Jev costs retain a conservative per-call reservation; verified local rejections consume no inference budget.'};
   };
   function cardFor(id,{hydrate=true,snapshots=new Map(),parsed=new Map()}={}) {
     const item=store.getCapability(id);if(!item)return null;
@@ -60,7 +62,7 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
     const base={id:item.id,name:text(item.name,200),url:item.url,description:text(item.description,1200),provider:text(item.provider,100),sourceKind:item.kind,tags:(item.tags||[]).filter(x=>typeof x==='string').slice(0,15)};
     // Evidence IDs already bind URL + content hash. Catalogue staleness checks
     // must never parse the original multi-megabyte registry body per record.
-    const sourceFingerprint=hash({schema:INTELLIGENCE_SCHEMA,...base,evidenceIds:refs,revision:item.provenance?.resolvedRevision||item.provenance?.revision||null,sourceHash:item.provenance?.sourceHash||null});
+    const sourceFingerprint=classificationFingerprint({base,evidenceIds:refs,revision:item.provenance?.resolvedRevision||item.provenance?.revision||null,sourceHash:item.provenance?.sourceHash||null});
     if(!hydrate)return {...base,evidenceIds:refs,sourceFingerprint};
     const evidence=refs.slice(0,3).map(id=>{if(!snapshots.has(id))snapshots.set(id,store.getEvidence(id));return snapshots.get(id);}).filter(snapshot=>snapshot&&publicURL(snapshot.url)).map(snapshot=>({id:snapshot.id,sha256:snapshot.sha256,url:snapshot.url,excerpt:excerpt(snapshot,item,parsed)}));
     return {...base,evidenceIds:evidence.map(x=>x.id),evidence,sourceFingerprint};
@@ -84,15 +86,15 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
   function assessment(id) {
     if(!store.getCapability(id))return null;
     const classified=db.get('assessments',id),correction=db.get('corrections',id),card=cardFor(id,{hydrate:false});
-    const stale=!!classified&&classified.sourceFingerprint!==card?.sourceFingerprint;
+    const stale=!!classified&&(classified.policyVersion!==INTELLIGENCE_POLICY||classified.sourceFingerprint!==card?.sourceFingerprint);
     const values={artifact:'unknown',adoption:'unknown',capabilities:[],confidence:null,evidenceIds:[],...(classified?.classification||{}),...(correction?.patch||{})};
-    return {capabilityId:id,...values,status:stale?'stale':correction?'corrected':!classified?'unclassified':values.confidence>=settings.confidenceThreshold&&values.artifact!=='unknown'?'classified':'needs-review',stale,humanCorrected:!!correction,provider:classified?.provider||null,model:classified?.model||null,updatedAt:correction?.updatedAt||classified?.updatedAt||null,classification:classified?.classification||null,correction:correction?.patch||null,sourceFingerprint:classified?.sourceFingerprint||null,currentFingerprint:card?.sourceFingerprint||null,schemaVersion:INTELLIGENCE_SCHEMA};
+    return {capabilityId:id,...values,status:stale?'stale':correction?'corrected':!classified?'unclassified':values.confidence>=settings.confidenceThreshold&&values.artifact!=='unknown'?'classified':'needs-review',stale,humanCorrected:!!correction,provider:classified?.provider||null,model:classified?.model||null,updatedAt:correction?.updatedAt||classified?.updatedAt||null,classification:classified?.classification||null,correction:correction?.patch||null,sourceFingerprint:classified?.sourceFingerprint||null,currentFingerprint:card?.sourceFingerprint||null,schemaVersion:INTELLIGENCE_SCHEMA,policyVersion:classified?(classified.policyVersion||LEGACY_CLASSIFICATION_POLICY):null,currentPolicyVersion:INTELLIGENCE_POLICY};
   }
   function persistAssessment(card,classification,{provider,model,jobId=null}) {
     const validated=validateAssessment(classification,card);
     const previous=db.get('assessments',card.id);
-    if(previous?.provider===provider&&previous?.model===model&&previous?.sourceFingerprint===card.sourceFingerprint&&JSON.stringify(previous.classification)===JSON.stringify(validated))return assessment(card.id);
-    db.save('assessments',{id:card.id,classification:validated,provider,model,jobId,sourceFingerprint:card.sourceFingerprint,schemaVersion:INTELLIGENCE_SCHEMA,updatedAt:now()});
+    if(previous?.provider===provider&&previous?.model===model&&previous?.policyVersion===INTELLIGENCE_POLICY&&previous?.sourceFingerprint===card.sourceFingerprint&&JSON.stringify(previous.classification)===JSON.stringify(validated))return assessment(card.id);
+    db.save('assessments',{id:card.id,classification:validated,provider,model,jobId,sourceFingerprint:card.sourceFingerprint,schemaVersion:INTELLIGENCE_SCHEMA,policyVersion:INTELLIGENCE_POLICY,updatedAt:now()});
     return assessment(card.id);
   }
   function decorate(items,{query='',artifact}={}) {
@@ -103,16 +105,16 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
     return items.map(item=>{
       const info=assessment(item.id),inferred=[info?.artifact,info?.adoption,...(info?.capabilities||[])].join(' ').toLowerCase();
       const shared=item.origin==='shared'&&item.sharedAssessment?[item.sharedAssessment.artifact,item.sharedAssessment.adoption,...(item.sharedAssessment.capabilities||[])].join(' ').toLowerCase():'';
-      const fields={name:text(item.name).toLowerCase(),tags:(item.tags||[]).join(' ').toLowerCase(),description:text(item.description,4000).toLowerCase(),provider:text(item.provider).toLowerCase(),kind:item.kind,framework:text(item.framework).toLowerCase(),outcomes:outcomeText.get(item.id)||'',inferred,sharedInferred:shared};
+      const fields={name:text(item.name).toLowerCase(),tags:(item.tags||[]).join(' ').toLowerCase(),description:text(item.description,4000).toLowerCase(),provider:text(item.provider).toLowerCase(),kind:item.kind,framework:text(item.framework).toLowerCase(),outcomes:outcomeText.get(item.id)||'',inferred,sharedInferred:shared,sourceDetails:[item.details?.overview,...item.details?.features||[],...item.details?.keywords||[],...(item.details?.sections||[]).map(section=>section.title+' '+section.summary)].filter(Boolean).join(' ').toLowerCase()};
       const matches=terms.filter(term=>Object.values(fields).some(value=>String(value).includes(term)));
-      const score=terms.reduce((sum,term)=>sum+(fields.name.includes(term)?4:0)+(fields.tags.includes(term)?3:0)+(fields.description.includes(term)?1:0)+(inferred.includes(term)?3:0)+(shared.includes(term)?2:0),0);
+      const score=terms.reduce((sum,term)=>sum+(fields.name.includes(term)?4:0)+(fields.tags.includes(term)?3:0)+(fields.description.includes(term)?1:0)+(inferred.includes(term)?3:0)+(shared.includes(term)?2:0)+(fields.sourceDetails.includes(term)?1:0),0);
       return {...item,assessment:info,matchReason:terms.length?`Text matched: ${matches.join(', ')} (${matches.length}/${terms.length} terms), including inferred labels and local outcome context${matches.some(term=>shared.includes(term))?'; attributed shared labels are not locally verified':''}. Classification is not verified compatibility.`:item.matchReason,_matches:matches.length,_score:score};
     }).filter(item=>(!terms.length||item._matches)&&(!artifact||artifact==='all'||item.assessment?.artifact===artifact)).sort((a,b)=>b._score-a._score||comparePopularity(a,b)).map(({_matches,_score,...item})=>item);
   }
   async function providerState(){const state=await providers.status?.()||{};for(const provider of ['codex','jev'])if(state[provider]?.model)observedModels[provider]=state[provider].model;return state;}
   function needsClassification(card,provider,model) {
     const previous=db.get('assessments',card.id);
-    return !previous||previous.schemaVersion!==INTELLIGENCE_SCHEMA||previous.sourceFingerprint!==card.sourceFingerprint||previous.provider!==provider||!!model&&previous.model!==model;
+    return !previous||previous.schemaVersion!==INTELLIGENCE_SCHEMA||previous.policyVersion!==INTELLIGENCE_POLICY||previous.sourceFingerprint!==card.sourceFingerprint||previous.provider!==provider||!!model&&previous.model!==model;
   }
   function selectCandidates(ids,query,limit,{classification=false,provider=settings.provider,model=observedModels[provider],pendingOnly=false,cardCache={snapshots:new Map(),parsed:new Map()}}={}) {
     const scope=ids?new Set(ids):null;
@@ -169,7 +171,11 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
       else receipt.costUsd=null;
       if(receipt.costUsd!==null)receipt.chargedOrReservedUsd=receipt.costUsd;
       return response;
-    }catch(error){receipt.status=signal.aborted?'cancelled':'failed';receipt.error=text(error.message,1000);throw error;}
+    }catch(error){
+      receipt.status=signal.aborted?'cancelled':'failed';receipt.error=text(error.message,1000);
+      if(isDefinitelyUnsentProviderError(error))Object.assign(receipt,{requestSent:false,costUsd:0,chargedOrReservedUsd:0,inputTokens:0,outputTokens:0});
+      throw error;
+    }
     finally{receipt.finishedAt=now();db.save('usage',receipt);job.usage.push(receipt);saveJob(job);}
   }
   async function classify(job,signal) {
@@ -199,14 +205,23 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
     checkAbort(signal);
     const misses=[];job.result.assessmentIds=[];job.result.cacheHits=0;
     for(const card of cards){
-      const key=model?hash({operation:'classify',schema:INTELLIGENCE_SCHEMA,provider:job.provider,model,fingerprint:card.sourceFingerprint}):null;
+      const key=model?hash({operation:'classify',schema:INTELLIGENCE_SCHEMA,policy:INTELLIGENCE_POLICY,provider:job.provider,model,fingerprint:card.sourceFingerprint}):null;
       const cached=key?db.get('cache',key):null;
       if(cached){persistAssessment(card,cached.classification,{provider:job.provider,model:cached.model,jobId:job.id});job.result.assessmentIds.push(card.id);job.result.cacheHits++;}
       else misses.push(card);
     }
     const batchSize=job.provider==='jev'?3:10,batches=[];let nextBatch=[];
-    const byteLimit=job.provider==='jev'?25000:55000;
-    for(const card of misses){if(nextBatch.length&&(nextBatch.length>=batchSize||Buffer.byteLength(JSON.stringify([...nextBatch,card]))>byteLimit)){batches.push(nextBatch);nextBatch=[];}nextBatch.push(card);}if(nextBatch.length)batches.push(nextBatch);
+    const fitsBatch=batch=>{
+      if(job.provider!=='jev')return Buffer.byteLength(JSON.stringify(batch))<=55000;
+      try{return measureJevClassificationBatch(batch).fits;}
+      catch(error){if(isDefinitelyUnsentProviderError(error)&&error.code==='INVALID_CARDS')return false;throw error;}
+    };
+    for(const card of misses){
+      if(!fitsBatch([card])){job.errors.push(`${card.id}: public source card exceeds the provider context bound; no request sent`);continue;}
+      if(nextBatch.length&&(nextBatch.length>=batchSize||!fitsBatch([...nextBatch,card]))){batches.push(nextBatch);nextBatch=[];}
+      nextBatch.push(card);
+    }
+    if(nextBatch.length)batches.push(nextBatch);
     for(const batch of batches){
       checkAbort(signal);job.stage='classifying';saveJob(job);
       const response=await callProvider(job,job.provider,'classify',{cards:batch},signal);
@@ -218,7 +233,7 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
         seen.add(card.id);
         try{
           const validated=validateAssessment(result,card);persistAssessment(card,validated,{provider:job.provider,model:response.model,jobId:job.id});
-          db.save('cache',{id:hash({operation:'classify',schema:INTELLIGENCE_SCHEMA,provider:job.provider,model:response.model,fingerprint:card.sourceFingerprint}),classification:validated,model:response.model,createdAt:now()});
+          db.save('cache',{id:hash({operation:'classify',schema:INTELLIGENCE_SCHEMA,policy:INTELLIGENCE_POLICY,provider:job.provider,model:response.model,fingerprint:card.sourceFingerprint}),classification:validated,model:response.model,policyVersion:INTELLIGENCE_POLICY,createdAt:now()});
           job.result.assessmentIds.push(card.id);
         }catch(error){job.errors.push(`${card.id}: ${error.message}`);}
       }
@@ -233,7 +248,7 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
     if(!cards.length){job.errors.push('No public evidence candidates available to rank');return;}
     const state=await providerState(),model=job.providerModels?.[job.provider]||state[job.provider]?.model;
     const assessmentRevisions=cards.map(card=>({id:card.id,updatedAt:assessment(card.id)?.updatedAt||null}));
-    const cacheKey=resolvedModel=>hash({operation:'rank',schema:INTELLIGENCE_SCHEMA,provider:job.provider,model:resolvedModel,query:job.query,cards,assessmentRevisions});
+    const cacheKey=resolvedModel=>hash({operation:'rank',schema:INTELLIGENCE_SCHEMA,policy:INTELLIGENCE_POLICY,provider:job.provider,model:resolvedModel,query:job.query,cards,assessmentRevisions});
     const cached=model?db.get('cache',cacheKey(model)):null;
     if(cached){job.result.rankings=cached.results;job.result.cacheHits=1;return;}
     job.stage='ranking';saveJob(job);

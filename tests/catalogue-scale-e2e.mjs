@@ -9,7 +9,7 @@ import {startServer} from '../src/server.mjs';
 const directory=await mkdtemp(join(tmpdir(),'glasses-scale-ui-'));
 const evidence=resolve(process.env.GLASSES_EVIDENCE_DIR||'evidence/catalogue-growth-2026-09-28/browser-scale');await mkdir(evidence,{recursive:true});
 const report={startedAt:new Date().toISOString(),result:'RUNNING',checks:[],limitations:['150 synthetic public candidates exercise real HTTP, SQLite, assessment filtering and browser rendering in an isolated server.','No real provider requests, credentials, main application data or settings are used.']};
-let app,browser,page,token;const errors=[];
+let app,browser,page,token;const errors=[],navigationTrace=[];
 const providers={plan:async()=>{throw new Error('Unexpected scale-test planning')},rank:async()=>{throw new Error('Unexpected scale-test ranking')},status:async()=>({codex:{available:true,authenticated:true,model:'scale-fixture'},jev:{configured:false,model:'jev-1.13.0'}}),classify:async(provider,{cards})=>({model:'scale-fixture',results:cards.map(card=>({id:card.id,artifact:'tool-library',adoption:'embed-package',capabilities:['synthetic scale'],confidence:.9,evidenceIds:card.evidenceIds})),usage:{inputTokens:1,outputTokens:1}})};
 async function api(path,method='GET',body){const response=await fetch(app.url+path,{method,headers:{'X-Glasses-Token':token,'Content-Type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})});const data=await response.json();assert.ok(response.ok,path+' '+response.status+' '+JSON.stringify(data));return data;}
 async function until(fn){const end=Date.now()+15000;while(Date.now()<end){const result=await fn();if(result)return result;await delay(50)}throw new Error('Expected state did not appear');}
@@ -20,6 +20,12 @@ const next=()=>page.getByRole('button',{name:'Next results',exact:true});
 const previous=()=>page.getByRole('button',{name:'Previous results',exact:true});
 const search=()=>page.getByRole('searchbox',{name:'Search catalogue'});
 async function settled(){await until(async()=>await page.locator('.catalogue-list').getAttribute('aria-busy')==='false')}
+async function expectResultCount(total){
+  const expected=total+' '+(total===1?'result':'results');
+  await until(async()=>await page.locator('.catalogue-list').getAttribute('aria-busy')==='false'&&(await page.locator('.results-heading>span').innerText()).trim()===expected);
+  assert.equal((await page.locator('.results-heading>span').innerText()).trim(),expected);
+}
+async function navigationState(){return page.evaluate(()=>({busy:document.querySelector('.catalogue-list')?.getAttribute('aria-busy'),range:document.querySelector('.catalogue-pagination span')?.textContent,first:document.querySelector('.capability-card strong')?.textContent,events:window.scaleNavigationEvents||[]}))}
 async function chooseStatus(value){const response=page.waitForResponse(response=>response.url().includes('/api/catalog?')&&new URL(response.url()).searchParams.get('assessmentStatus')===value);await statusFilter().selectOption(value);await response;await settled();}
 try{
   app=await startServer({port:0,dataDir:directory,autoScout:false,providers,discoveryFetcher:async url=>({url,status:200,contentType:'text/html',body:'<!doctype html><title>ZZZ Imported scale source</title><meta name="description" content="Synthetic unknown-licence source">'})});({token}=await(await fetch(app.url+'/api/session')).json());
@@ -34,12 +40,34 @@ try{
   }
   const run={id:'scale-run-fixture',status:'completed',startedAt:new Date().toISOString(),finishedAt:new Date().toISOString(),query:'Scale findings',candidateIds:candidates.slice(125,129).map(item=>item.id),added:4,updated:0,errors:[]};app.store.saveRun(run);
   const job=app.intelligence.enqueue({type:'classify',candidateIds:[candidates[149].id]});await until(()=>app.intelligence.getJob(job.id).status==='completed');
-  browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH?{executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH}:{})});report.browserVersion=browser.version();page=await browser.newPage({viewport:{width:1440,height:1000}});page.on('pageerror',error=>errors.push(error.message));await page.goto(app.url+'/#catalogue');
+  browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH?{executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH}:{})});report.browserVersion=browser.version();page=await browser.newPage({viewport:{width:1440,height:1000}});page.on('pageerror',error=>errors.push(error.message));
+  await page.addInitScript(()=>{window.scaleNavigationEvents=[];for(const type of ['pointerdown','pointerup','click'])document.addEventListener(type,event=>{const button=event.target.closest?.('.catalogue-pagination button');if(button)window.scaleNavigationEvents.push({type,time:performance.now(),text:button.textContent,disabled:button.disabled,busy:document.querySelector('.catalogue-list')?.getAttribute('aria-busy'),range:document.querySelector('.catalogue-pagination span')?.textContent})},true)});
+  page.on('response',response=>{if(new URL(response.url()).pathname==='/api/catalog')navigationTrace.push({type:'response',url:response.url(),status:response.status(),at:new Date().toISOString()})});await page.goto(app.url+'/#catalogue');
   await check('A large catalogue renders 60 cards per page and visits every result exactly once',async()=>{
-    const all=await api('/api/catalog');report.total=all.total;await until(async()=>await cards().count()===60);const seen=[];
+    const all=await api('/api/catalog');report.total=all.total;await expectResultCount(all.total);await until(async()=>await cards().count()===60);const seen=[];
     for(let index=0;index<Math.ceil(all.total/60);index++){await settled();seen.push(...await names());if(index+1<Math.ceil(all.total/60)){const first=(await names())[0];await next().click();await until(async()=>(await names())[0]!==first)}}
-    assert.equal(await next().isDisabled(),true);assert.deepEqual([...seen].sort(),all.items.map(item=>item.name).sort());assert.equal(new Set(seen).size,seen.length);assert.match(await page.locator('.results-heading').innerText(),new RegExp(all.total+' results'));
+    assert.equal(await next().isDisabled(),true);assert.deepEqual([...seen].sort(),all.items.map(item=>item.name).sort());assert.equal(new Set(seen).size,seen.length);await expectResultCount(all.total);
     await page.screenshot({path:join(evidence,'last-page.png'),fullPage:true,animations:'disabled'});
+  });
+  await check('A background refresh preserves the current page and cannot swallow an in-progress navigation click',async()=>{
+    let statusReady=false,catalogueReady=false,releaseStatus,releaseCatalogue;
+    const statusGate=new Promise(resolve=>releaseStatus=resolve),catalogueGate=new Promise(resolve=>releaseCatalogue=resolve);
+    const statusRoute=async route=>{const response=await route.fetch();statusReady=true;await statusGate;await route.fulfill({response})};
+    const catalogueRoute=async route=>{const response=await route.fetch();catalogueReady=true;await catalogueGate;await route.fulfill({response})};
+    await page.route('**/api/status',statusRoute);
+    app.store.saveRun({...run,finishedAt:new Date().toISOString()});
+    try{
+      await until(()=>statusReady);await settled();
+      const before=await navigationState();assert.equal(before.range,'121–161 of 161');
+      await page.route('**/api/catalog?*',catalogueRoute);
+      const bounds=await previous().boundingBox();assert.ok(bounds);await page.mouse.move(bounds.x+bounds.width/2,bounds.y+bounds.height/2);await page.mouse.down();
+      releaseStatus();await until(()=>catalogueReady);await until(async()=>await page.locator('.catalogue-list').getAttribute('aria-busy')==='true');
+      const during=await navigationState();assert.equal(during.range,before.range,'Background loading must not reset the page');
+      await page.mouse.up();await until(async()=>(await navigationState()).range==='61–120 of 161');
+      releaseCatalogue();await settled();const after=await navigationState();assert.equal(after.range,'61–120 of 161','The returned item array must preserve the user-selected page');
+      report.backgroundRefresh={before,during,after};
+      await next().click();await until(async()=>(await navigationState()).range==='121–161 of 161');
+    }finally{releaseStatus();releaseCatalogue();await page.mouse.up();await page.unroute('**/api/status',statusRoute);await page.unroute('**/api/catalog?*',catalogueRoute);}
   });
   await check('Page changes preserve inspection and search resets to its first page',async()=>{
     const selected=(await names())[0];await page.getByRole('button',{name:'Inspect '+selected,exact:true}).click();await previous().click();assert.equal(await page.locator('.detail-name').textContent(),selected);
@@ -47,7 +75,7 @@ try{
     await search().fill('');await until(async()=>await cards().count()===60);assert.equal(await previous().isDisabled(),true);
   });
   await check('Every assessment status filters correctly and low-confidence inference does not grant licence rights',async()=>{
-    for(const status of ['unclassified','classified','needs-review','stale','corrected']){const expected=await api('/api/catalog?assessmentStatus='+status);await chooseStatus(status);assert.equal(await cards().count(),Math.min(60,expected.total));assert.deepEqual(await names(),expected.items.slice(0,60).map(item=>item.name));assert.match(await page.locator('.results-heading').innerText(),new RegExp(expected.total+' results'));}
+    for(const status of ['unclassified','classified','needs-review','stale','corrected']){const expected=await api('/api/catalog?assessmentStatus='+status);await chooseStatus(status);await expectResultCount(expected.total);assert.equal(await cards().count(),Math.min(60,expected.total));assert.deepEqual(await names(),expected.items.slice(0,60).map(item=>item.name));}
     await chooseStatus('needs-review');await page.getByRole('button',{name:'Inspect Scale fixture 010',exact:true}).click();await page.getByText('40%',{exact:true}).waitFor();assert.match(await page.getByRole('region',{name:'Candidate assessment'}).innerText(),/Low confidence/);
     await page.getByRole('checkbox',{name:'Known OSS licence',exact:true}).check();await page.getByRole('heading',{name:'No matching capabilities.'}).waitFor();assert.equal((await api('/api/catalog/'+candidates[10].id)).item.licenseStatus,'unknown');await page.getByRole('checkbox',{name:'Known OSS licence',exact:true}).uncheck();
     await page.screenshot({path:join(evidence,'needs-review.png'),fullPage:true,animations:'disabled'});
@@ -70,4 +98,4 @@ try{
     assert.deepEqual(errors,[]);
   });
   report.result='PASS';
-}catch(error){report.result='FAIL';report.error=error.stack;console.error(error);process.exitCode=1;}finally{report.finishedAt=new Date().toISOString();await writeFile(join(evidence,'report.json'),JSON.stringify(report,null,2));await browser?.close();await app?.close();await rm(directory,{recursive:true,force:true});}
+}catch(error){report.result='FAIL';report.error=error.stack;if(page){report.failureState=await navigationState().catch(()=>null);await page.screenshot({path:join(evidence,'failure.png'),fullPage:true,animations:'disabled'}).catch(()=>{});}console.error(error);process.exitCode=1;}finally{report.navigationTrace=navigationTrace;report.finishedAt=new Date().toISOString();await writeFile(join(evidence,'report.json'),JSON.stringify(report,null,2));await browser?.close();await app?.close();await rm(directory,{recursive:true,force:true});}

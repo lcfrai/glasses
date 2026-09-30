@@ -3,6 +3,9 @@ import { z } from 'zod';
 import { validatePublicURL } from './discovery.mjs';
 import { stableId, licenseInfo } from './store.mjs';
 import { ARTIFACTS, ADOPTIONS, INTELLIGENCE_SCHEMA } from './intelligence.mjs';
+import { githubRepositoryKind } from './github-kind.mjs';
+import { classificationFingerprint, LEGACY_CLASSIFICATION_POLICY } from './classification-policy.mjs';
+import { enrichCatalogueDetails } from './catalogue-details.mjs';
 
 export const PUBLIC_CATALOGUE_FORMAT = 'glasses-public-catalogue';
 export const PUBLIC_CATALOGUE_VERSION = 1;
@@ -27,13 +30,14 @@ const urlSchema = z.string().max(4000).refine(value => publicLink(value) === val
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
 const idSchema = z.string().regex(/^[a-f0-9]{20}$/);
 const timestamp = z.string().datetime();
-const citationSchema = z.object({ id:idSchema, endpoint:urlSchema, recordUrl:urlSchema, sha256:digest, observedAt:timestamp, kind:z.enum(['github-repository-metadata','github-search-metadata','registry-directory','registry-item-index','registry-item-document','github-source-evidence']) }).strict();
+const citationSchema = z.object({ id:idSchema, endpoint:urlSchema, recordUrl:urlSchema, sha256:digest, observedAt:timestamp, kind:z.enum(['github-repository-metadata','github-search-metadata','registry-directory','registry-item-index','registry-item-document','github-source-evidence','github-artifact-document','source-preview-document']) }).strict();
 const assessmentSchema = z.object({ artifact:z.enum(ARTIFACTS), adoption:z.enum(ADOPTIONS), capabilities:z.array(bounded(100).min(1)).max(20), confidence:z.number().min(0).max(1), provider:z.enum(['codex','jev']), model:bounded(120).min(1), schemaVersion:z.literal(INTELLIGENCE_SCHEMA), assessedAt:timestamp, citationIds:z.array(idSchema).min(1).max(20) }).strict();
+const detailsSchema=z.object({resourceType:z.enum(['component','tool','skill','agent','collection','reference']).optional(),keywords:z.array(bounded(80)).max(20).optional(),overview:bounded(800).optional(),features:z.array(bounded(180)).max(8).optional(),sections:z.array(z.object({title:bounded(100),summary:bounded(280)}).strict()).max(8).optional(),parent:z.object({id:idSchema,url:urlSchema,name:bounded(200)}).strict().optional(),memberCount:z.number().int().min(0).max(100000).optional(),citationIds:z.array(idSchema).min(1).max(8),dependencies:z.array(bounded(150)).max(20).optional(),registryDependencies:z.array(bounded(250)).max(20).optional(),sourceFileCount:z.number().int().min(0).max(10000).optional(),documentationUrl:urlSchema.optional(),sourceUrl:urlSchema.optional(),agentUsage:z.object({triggers:z.array(bounded(200)).max(6).optional(),inputs:z.array(bounded(200)).max(6).optional(),outputs:z.array(bounded(200)).max(6).optional(),compatibility:z.array(bounded(150)).max(8).optional()}).strict().optional(),distribution:z.object({url:urlSchema,sha256:digest,bytes:z.number().int().min(1).max(33554432),revision:z.string().regex(/^[a-f0-9]{40}$/),sourceUrl:urlSchema,fileCount:z.number().int().min(1).max(1000)}).strict().optional(),preview:z.object({imageUrl:urlSchema,sourceUrl:urlSchema,alt:bounded(200),capturedAt:timestamp}).strict().optional()}).strict();
 const itemSchema = z.object({
   id:idSchema,url:urlSchema,name:bounded(200).min(1),description:bounded(1200),kind:z.enum(['solution','component','pattern','reference']),provider:bounded(200).min(1),tags:z.array(bounded(100)).max(30),framework:bounded(100).nullable(),
-  license:z.object({spdx:bounded(100).nullable(),status:z.enum(['known','restricted','unknown']),scope:z.enum(['repository','registry-provider','registry-item']),basis:z.literal('upstream-metadata')}).strict(),
+  license:z.object({spdx:bounded(100).nullable(),status:z.enum(['known','restricted','unknown']),scope:z.enum(['repository','registry-provider','registry-item','source-artifact']),basis:z.enum(['upstream-metadata','source-declaration'])}).strict(),
   github:z.object({stars:z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),starsObservedAt:timestamp.nullable(),archived:z.boolean().nullable()}).strict().nullable(),
-  observedAt:timestamp,citations:z.array(citationSchema).min(1).max(21),assessment:assessmentSchema.nullable()
+  observedAt:timestamp,citations:z.array(citationSchema).min(1).max(21),assessment:assessmentSchema.nullable(),details:detailsSchema.optional()
 }).strict();
 export const publicCatalogueSchema = z.object({
   format:z.literal(PUBLIC_CATALOGUE_FORMAT),formatVersion:z.literal(1),generatedAt:timestamp,contentHash:digest,
@@ -46,6 +50,18 @@ function counts(items) { return { total:items.length,byKind:Object.fromEntries([
 function contentHash(items) { return sha(canonical({format:PUBLIC_CATALOGUE_FORMAT,formatVersion:1,items})); }
 function envelope(items, generatedAt) { const sorted=[...items].sort((a,b)=>a.id.localeCompare(b.id)); return {format:PUBLIC_CATALOGUE_FORMAT,formatVersion:1,generatedAt:date(generatedAt),contentHash:contentHash(sorted),capabilities:{portableInferenceCache:false,sourceBodies:false},counts:counts(sorted),items:sorted}; }
 
+// Enrichment takes an already validated public projection, never private local
+// capability fields. Exact retained source bodies are used only as evidence.
+export function enrichPublicCatalogue(input,{evidence=[],generatedAt=new Date().toISOString()}={}) {
+  const pack=validatePublicCatalogue(input);
+  return validatePublicCatalogue(envelope(enrichCatalogueDetails({items:pack.items,evidence}),generatedAt));
+}
+
+export function withPublicCatalogueItems(input,items,{generatedAt=new Date().toISOString()}={}) {
+  validatePublicCatalogue(input);
+  return validatePublicCatalogue(envelope(items,generatedAt));
+}
+
 export function validatePublicCatalogue(input) {
   const serialized = typeof input === 'string' ? input : JSON.stringify(input);
   if (Buffer.byteLength(serialized) > MAX_BYTES) throw new Error('Public catalogue exceeds 32 MiB');
@@ -56,9 +72,12 @@ export function validatePublicCatalogue(input) {
     if(item.id!==stableId(item.url)||seen.has(item.id))throw new Error('Invalid or duplicate public candidate identity');seen.add(item.id);
     const refs=new Set();for(const citation of item.citations){if(citation.id!==stableId(canonical({endpoint:citation.endpoint,recordUrl:citation.recordUrl,sha256:citation.sha256}))||refs.has(citation.id))throw new Error('Invalid or duplicate public citation identity');refs.add(citation.id);}
     if(item.assessment?.citationIds.some(id=>!refs.has(id)))throw new Error('Assessment cites unavailable public metadata');
+    if(item.details?.citationIds.some(id=>!refs.has(id)))throw new Error('Details cite unavailable public metadata');
     const rights=licenseInfo(item.license.spdx);if(rights.licenseStatus!==item.license.status||rights.license!==item.license.spdx)throw new Error('Inconsistent public licence metadata');
     if((item.github?.stars==null)!==(item.github?.starsObservedAt==null))throw new Error('Stars require an observation date');
   }
+  const byId=new Map(pack.items.map(item=>[item.id,item])),memberCounts=new Map();for(const child of pack.items){const parent=child.details?.parent?.id;if(parent)memberCounts.set(parent,(memberCounts.get(parent)||0)+1);}
+  for(const item of pack.items){const parent=item.details?.parent;if(parent){const source=byId.get(parent.id);if(!source||source.id===item.id||source.url!==parent.url||source.name!==parent.name)throw new Error('Invalid collection parent');const chain=new Set([item.id]);let current=source;while(current){if(chain.has(current.id)||chain.size>8)throw new Error('Cyclic collection membership');chain.add(current.id);current=byId.get(current.details?.parent?.id);}}if(item.details?.memberCount!==undefined&&item.details.memberCount!==(memberCounts.get(item.id)||0))throw new Error('Collection member count does not match');}
   if(canonical(pack.counts)!==canonical(counts(pack.items))||pack.contentHash!==contentHash(pack.items))throw new Error('Public catalogue counts or content hash do not match');
   return pack;
 }
@@ -83,7 +102,7 @@ function projection(item,snapshot) {
     if(!repo||repo.private!==false||!repoURL(url))return null;
     if(source.pathname.startsWith('/repositories/')&&(!Number.isSafeInteger(repo.id)||repo.id<1||String(repo.id)!==source.pathname.split('/').at(-1)))return null;
     const words=`${repo.name||''} ${repo.description||''} ${(repo.topics||[]).join(' ')}`.toLowerCase();
-    const recordKind=/\b(?:samples|tutorials?|examples)\b/.test((repo.name||'').toLowerCase())?'pattern':/component|react-ui|ui-library/.test(words)?'component':'solution';
+    const recordKind=githubRepositoryKind(repo);
     const stars=Number.isSafeInteger(repo.stargazers_count)&&repo.stargazers_count>=0?repo.stargazers_count:null;
     fields={name:text(repo.full_name||repo.name,200),description:text(repo.description||'Public repository; inspect upstream for applicability.',1200),kind:recordKind,provider:'GitHub',tags:tags(repo.topics).slice(0,25),framework:/react/.test(words)?'React':null,license:rights(repo.license,'repository'),github:{stars,starsObservedAt:stars===null?null:date(snapshot.lastFetchedAt||snapshot.firstFetchedAt),archived:typeof repo.archived==='boolean'?repo.archived:null}};
     kind=source.pathname==='/search/repositories'?'github-search-metadata':'github-repository-metadata';
@@ -109,8 +128,9 @@ function sourceSafe(snapshot,item){
     if(url.pathname==='/search/repositories')return !url.search&&Array.isArray(snapshot.data?.items)&&snapshot.data.items.every(repo=>repo.private===false);
     if(/^\/repositories\/[1-9]\d*$/.test(url.pathname))return !url.search&&snapshot.data?.private===false&&Number.isSafeInteger(snapshot.data.id)&&String(snapshot.data.id)===url.pathname.split('/').at(-1)&&repoURL(snapshot.data.html_url)?.toLowerCase()===repoURL(item.url)?.toLowerCase();
     if(!/^\/repos\/[^/]+\/[^/]+(?:\/(?:readme|license|commits\/[a-f0-9]{40}))?$/.test(url.pathname))return false;
-    const prefix=new URL(item.url).pathname.replace(/^\//,'/repos/');
-    const sameRepository=url.pathname===prefix||url.pathname.startsWith(prefix+'/');
+    const prefix=new URL(item.url).pathname.replace(/^\//,'/repos/').toLowerCase();
+    const sourcePath=url.pathname.toLowerCase();
+    const sameRepository=sourcePath===prefix||sourcePath.startsWith(prefix+'/');
     return sameRepository&&[...url.searchParams.keys()].every(key=>key==='ref')&&(!url.search||/^[a-f0-9]{40}$/i.test(url.searchParams.get('ref')||''));
   }
   return !url.search&&(url.href==='https://registry.directory/items.json'||url.href==='https://registry.directory/directory.json'||url.href===item.url&&Array.isArray(snapshot.data?.files));
@@ -121,7 +141,7 @@ function attachAssessment(projected,item,assessment,getSnapshot){
   const base={id:item.id,name:text(item.name,200),url:item.url,description:text(item.description,1200),provider:text(item.provider,100),sourceKind:item.kind,tags:tags(item.tags).slice(0,15)};
   const publicBase={id:projected.id,name:projected.name,url:projected.url,description:projected.description,provider:text(projected.provider,100),sourceKind:projected.kind,tags:projected.tags.slice(0,15)};
   if(canonical(base)!==canonical(publicBase))return false;
-  const refs=retainedRefs(item),fingerprint=sha(JSON.stringify({schema:INTELLIGENCE_SCHEMA,...base,evidenceIds:refs,revision:item.provenance?.resolvedRevision||item.provenance?.revision||null,sourceHash:item.provenance?.sourceHash||null}));
+  const refs=retainedRefs(item),fingerprint=classificationFingerprint({base,evidenceIds:refs,revision:item.provenance?.resolvedRevision||item.provenance?.revision||null,sourceHash:item.provenance?.sourceHash||null,policy:assessment.policyVersion||LEGACY_CLASSIFICATION_POLICY});
   if(assessment.sourceFingerprint!==fingerprint)return false;
   const used=refs.slice(0,3).map(getSnapshot);if(!used.length||used.some(snapshot=>!sourceSafe(snapshot,item)))return false;
   const classification=assessment.classification;if(!classification||!Array.isArray(classification.evidenceIds)||!classification.evidenceIds.length||classification.evidenceIds.some(id=>!used.some(snapshot=>snapshot.id===id)))return false;
@@ -153,9 +173,23 @@ export function createPublicCatalogue({capabilities,evidence,assessments=[],gene
 }
 
 /** Merge only the public layer. Never touches the local catalogue, jobs, keys or model cache. */
+export function isNewerPublicItem(previous,item,{previousGeneratedAt,incomingGeneratedAt}={}) {
+  if(item.observedAt>previous.observedAt)return true;
+  if(item.observedAt!==previous.observedAt||!(incomingGeneratedAt>previousGeneratedAt))return false;
+  // Reassessment can change without a new GitHub metadata observation. Keep
+  // source facts fixed, require a newer publication and reject older/tied
+  // conflicting assessments. A newer publisher may withdraw an assessment.
+  // Projection places the primary metadata citation first. Assessment attachment
+  // can decorate that same citation as source evidence; its identity and bytes
+  // must stay identical, while that display role may change.
+  const facts=({assessment,details,citations,...rest})=>{const {kind,...primary}=citations[0];return{...rest,primaryCitation:primary};};
+  if(canonical(facts(previous))!==canonical(facts(item)))return false;
+  if(item.assessment&&previous.assessment&&(item.assessment.assessedAt<previous.assessment.assessedAt||item.assessment.assessedAt===previous.assessment.assessedAt&&canonical(item.assessment)!==canonical(previous.assessment)))return false;
+  return canonical(item)!==canonical(previous);
+}
 export function mergePublicCatalogues(current,incoming,{generatedAt=new Date().toISOString()}={}) {
   const old=validatePublicCatalogue(current),next=validatePublicCatalogue(incoming),items=new Map(old.items.map(item=>[item.id,item]));
   const report={added:0,updated:0,unchanged:0,conflicts:0};
-  for(const item of next.items){const previous=items.get(item.id);if(!previous){items.set(item.id,item);report.added++;}else if(canonical(previous)===canonical(item)){report.unchanged++;}else if(item.observedAt>previous.observedAt){items.set(item.id,item);report.updated++;}else{report.conflicts++;}}
+  for(const item of next.items){const previous=items.get(item.id);if(!previous){items.set(item.id,item);report.added++;}else if(canonical(previous)===canonical(item)){report.unchanged++;}else if(isNewerPublicItem(previous,item,{previousGeneratedAt:old.generatedAt,incomingGeneratedAt:next.generatedAt})){items.set(item.id,item);report.updated++;}else{report.conflicts++;}}
   return {snapshot:validatePublicCatalogue(envelope([...items.values()],generatedAt)),report};
 }

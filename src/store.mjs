@@ -4,8 +4,11 @@ import { resolve, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { normalizeFiles, normalizeVisualEdits, visualStyles, reviewedDependencies } from './workspace.mjs';
 import { validateResearchPlan } from './research.mjs';
+import { makeDesignReview, reviseDesignReview, decideDesignReview } from './design-reviews.mjs';
 
 export const KINDS = ['solution', 'component', 'pattern', 'reference'];
+export const RESOURCE_TYPES=['component','tool','skill','agent','collection','reference'];
+export const resourceTypeOf=item=>item.details?.resourceType||(item.kind==='solution'?'tool':item.kind==='component'?'component':'reference');
 export const OPEN_LICENSES = new Set(['MIT','Apache-2.0','BSD-2-Clause','BSD-3-Clause','ISC','MPL-2.0','GPL-2.0','GPL-2.0-only','GPL-2.0-or-later','GPL-3.0','GPL-3.0-only','GPL-3.0-or-later','LGPL-2.1','LGPL-2.1-only','LGPL-2.1-or-later','LGPL-3.0','LGPL-3.0-only','LGPL-3.0-or-later','AGPL-3.0','AGPL-3.0-only','AGPL-3.0-or-later','Unlicense','0BSD','BSL-1.0','Zlib','EPL-2.0']);
 export const stableId = value => createHash('sha256').update(value).digest('hex').slice(0, 20);
 const now = () => new Date().toISOString();
@@ -30,24 +33,40 @@ export function createStore(dataDir = process.env.GLASSES_DATA_DIR || '.glasses'
     CREATE TABLE IF NOT EXISTS outcomes (id TEXT PRIMARY KEY, data TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, data TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS research_plans (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS design_reviews (id TEXT PRIMARY KEY, data TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, data TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, data TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS evidence (id TEXT PRIMARY KEY, data TEXT NOT NULL);`);
   const all = table => db.prepare(`SELECT data FROM ${table}`).all().map(parse);
   const get = (table, id) => parse(db.prepare(`SELECT data FROM ${table} WHERE id=?`).get(id));
   const save = (table, data) => {db.prepare(`INSERT INTO ${table} (id,data) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data`).run(data.id, JSON.stringify(data)); return data;};
+  const mutateDesignReview = (id, transform) => {
+    // Serialize the read/version-check/write across other local processes too.
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const previous=get('design_reviews',id);
+      const result=previous ? save('design_reviews',transform(previous)) : null;
+      db.exec('COMMIT');return result;
+    } catch(error) {db.exec('ROLLBACK');throw error;}
+  };
   const sharedCapability = row => {
     if(!row)return null;const item=row.item;
     return {id:item.id,url:item.url,name:item.name,description:item.description,kind:item.kind,provider:item.provider,tags:item.tags,framework:item.framework,license:item.license.spdx,licenseStatus:item.license.status,
       licenseEvidence:{status:'metadata-only',scope:item.license.scope,sourceUrl:item.url,spdx:item.license.spdx,note:'Imported upstream metadata claim; no original licence text or local verification is included.'},
       origin:'shared',discoveredAt:row.importedAt,updatedAt:row.importedAt,sourceItemUrl:item.citations.some(citation=>citation.kind==='registry-item-document')?item.url:undefined,github:item.github?{stars:item.github.stars,starsFetchedAt:item.github.starsObservedAt,archived:item.github.archived}:undefined,
-      sharedPublication:{contentHash:row.contentHash,generatedAt:row.generatedAt,importedAt:row.importedAt,portableInferenceCache:false,sourceBodies:false},sharedCitations:item.citations,sharedAssessment:item.assessment,
+      sharedPublication:{contentHash:row.contentHash,generatedAt:row.generatedAt,importedAt:row.importedAt,portableInferenceCache:false,sourceBodies:false},sharedCitations:item.citations,sharedAssessment:item.assessment,...(item.details?{details:item.details,detailsBasis:'Published source details; not independently verified by this installation.'}:{}),
       provenance:{sourceUrl:item.url,fetchedAt:item.observedAt,note:'Imported public catalogue metadata. Citations and model labels are attributed to the pack; source has not been independently fetched or verified by this installation.'}};
   };
-  const capability = id => get('capabilities',id)||sharedCapability(get('shared_capabilities',id));
-  const capabilities = () => {const items=new Map(all('shared_capabilities').map(row=>[row.id,sharedCapability(row)]));for(const item of all('capabilities'))items.set(item.id,item);return [...items.values()];};
+  const withSharedDetails=(local,shared)=>{if(!local)return shared;if(local.details&&!local.detailsPublication&&!local.sharedPublication||!shared?.details)return local;return {...local,details:shared.details,detailsCitations:shared.sharedCitations,detailsBasis:'Published source details from '+shared.sharedPublication.generatedAt+'; inspect current local source before adoption.',detailsPublication:shared.sharedPublication};};
+  const capability = id => withSharedDetails(get('capabilities',id),sharedCapability(get('shared_capabilities',id)));
+  const capabilities = () => {const items=new Map(all('shared_capabilities').map(row=>[row.id,sharedCapability(row)]));for(const item of all('capabilities'))items.set(item.id,withSharedDetails(item,items.get(item.id)));return [...items.values()];};
   return {
     directory, close: () => db.close(),
+    designReviews: () => all('design_reviews').sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)||a.id.localeCompare(b.id)),
+    getDesignReview: id => get('design_reviews',id),
+    createDesignReview: input => save('design_reviews',makeDesignReview(input)),
+    updateDesignReview: (id,input) => mutateDesignReview(id,previous=>reviseDesignReview(previous,input)),
+    decideDesignReview: (id,input) => mutateDesignReview(id,previous=>decideDesignReview(previous,input)),
     retainEvidence({url,body,contentType='',status=200,transport='direct',fetchedAt=now()}) {
       if(typeof body!=='string') throw new Error('Evidence requires the exact fetched text');
       const sha256=createHash('sha256').update(body).digest('hex');
@@ -62,7 +81,7 @@ export function createStore(dataDir = process.env.GLASSES_DATA_DIR || '.glasses'
     async importPublicCatalogue(input) {
       // Dynamic import avoids making the local store depend on projection initialization.
       // Validation completes before the one-table transaction; no network/model hook runs.
-      const {validatePublicCatalogue}=await import('./public-catalogue.mjs');const pack=validatePublicCatalogue(input);
+      const {validatePublicCatalogue,isNewerPublicItem}=await import('./public-catalogue.mjs');const pack=validatePublicCatalogue(input);
       const report={contentHash:pack.contentHash,added:0,updated:0,unchanged:0,conflicts:0,localOverrides:0};
       db.exec('BEGIN IMMEDIATE');
       try{
@@ -70,7 +89,7 @@ export function createStore(dataDir = process.env.GLASSES_DATA_DIR || '.glasses'
           const previous=get('shared_capabilities',item.id);
           if(get('capabilities',item.id))report.localOverrides++;
           if(previous&&JSON.stringify(previous.item)===JSON.stringify(item)){report.unchanged++;continue;}
-          if(previous&&previous.item.observedAt>=item.observedAt){report.conflicts++;continue;}
+          if(previous&&!isNewerPublicItem(previous.item,item,{previousGeneratedAt:previous.generatedAt,incomingGeneratedAt:pack.generatedAt})){report.conflicts++;continue;}
           save('shared_capabilities',{id:item.id,item,contentHash:pack.contentHash,generatedAt:pack.generatedAt,importedAt:now()});report[previous?'updated':'added']++;
         }
         db.exec('COMMIT');return report;
@@ -92,6 +111,9 @@ export function createStore(dataDir = process.env.GLASSES_DATA_DIR || '.glasses'
         discoveredAt: previous?.discoveredAt || stamp, updatedAt: stamp,
         provenance: {sourceUrl: url, fetchedAt: stamp, ...previous?.provenance, ...input.provenance}
       };
+      // Read-time public details must never become a permanent local override
+      // when an ordinary source refresh spreads the inspected item back here.
+      if(item.detailsPublication||item.sharedPublication){delete item.details;delete item.detailsBasis;delete item.detailsPublication;delete item.detailsCitations;}
       db.prepare('INSERT INTO capabilities (id,url,data) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET url=excluded.url,data=excluded.data').run(item.id, url, JSON.stringify(item));
       return {item, added: !previous};
     },
@@ -109,6 +131,16 @@ export function createStore(dataDir = process.env.GLASSES_DATA_DIR || '.glasses'
     counts() {const items=capabilities();return Object.fromEntries([['total',items.length],...KINDS.map(kind=>[kind,items.filter(x=>x.kind===kind).length])]);},
     getSetting(key, fallback) {return parse(db.prepare('SELECT data FROM settings WHERE key=?').get(key)) ?? fallback;},
     setSetting(key, value) {db.prepare('INSERT INTO settings (key,data) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data').run(key,JSON.stringify(value));return value;},
+    acquireSettingLease(key, lease) {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const previous=parse(db.prepare('SELECT data FROM settings WHERE key=?').get(key));
+        if(previous&&(!Number.isFinite(Date.parse(previous.expiresAt))||Date.parse(previous.expiresAt)>Date.now())){db.exec('COMMIT');return false;}
+        db.prepare('INSERT INTO settings (key,data) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data').run(key,JSON.stringify(lease));
+        db.exec('COMMIT');return true;
+      }catch(error){db.exec('ROLLBACK');throw error;}
+    },
+    releaseSettingLease(key, id) {db.prepare("DELETE FROM settings WHERE key=? AND json_extract(data,'$.id')=?").run(key,id);},
     saveRun: run=>save('runs',run),
     recoverInterruptedRuns() {
       const interrupted=all('runs').filter(run=>run.status==='running');

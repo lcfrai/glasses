@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { createStore } from '../src/store.mjs';
 import { createDiscovery } from '../src/discovery.mjs';
 
@@ -68,6 +69,58 @@ test('real repository roots still use metadata API, canonical URLs and pinned re
   assert.equal(inspected.repositoryEvidence.length,3);
   assert.equal(inspected.licenseEvidence.status,'fetched');
   assert.ok(requests.includes(`https://api.github.com/repos/openai/codex/readme?ref=${sha}`));
+});
+
+test('legacy trailing-hyphen GitHub owner imports and retains exact pinned README and licence evidence',async t=>{
+  const requests=[],revision='e'.repeat(40),endpoint='https://api.github.com/repos/mjl-/mox';
+  const contents={license:'MIT fixture licence for the legacy owner\n',readme:'# Mox fixture\nA complete mail server.\n'};
+  const documents=new Map();
+  const {store,discovery}=await fixture(t,async url=>{
+    requests.push(url);
+    let doc;
+    if(url===endpoint)doc=json(url,{...repository('mjl-','mox'),private:false,fork:false,archived:false,disabled:false});
+    else if(url===`${endpoint}/commits/main`)doc=json(url,{sha:revision});
+    else {
+      const resource=url===`${endpoint}/license?ref=${revision}`?'license':url===`${endpoint}/readme?ref=${revision}`?'readme':null;
+      assert.ok(resource,'Only the exact legacy-owner repository and pinned source endpoints may be fetched');
+      doc=json(url,{encoding:'base64',path:resource==='license'?'LICENSE':'README.md',content:Buffer.from(contents[resource]).toString('base64'),...(resource==='license'?{license:{spdx_id:'MIT'}}:{})});
+    }
+    documents.set(url,doc);return doc;
+  });
+  const imported=await discovery.importUrl('https://github.com/mjl-/mox');
+  assert.equal(imported.kind,'solution');assert.equal(imported.url,'https://github.com/mjl-/mox');
+  assert.equal(imported.metadataEvidence.url,endpoint);
+  const inspected=await discovery.inspect(imported.id,{fetchSource:true});
+  assert.equal(inspected.id,imported.id);assert.equal(inspected.sourceState.status,'ok');
+  assert.equal(inspected.provenance.resolvedRevision,revision);
+  assert.deepEqual(inspected.repositoryFiles,[{path:'LICENSE',content:contents.license},{path:'README.md',content:contents.readme}]);
+  assert.equal(inspected.licenseEvidence.status,'fetched');assert.equal(inspected.licenseEvidence.revision,revision);
+  assert.equal(inspected.licenseEvidence.sourceUrl,`${endpoint}/license?ref=${revision}`);
+  assert.equal(inspected.licenseEvidence.sha256,createHash('sha256').update(contents.license).digest('hex'));
+  assert.deepEqual(requests,[endpoint,`${endpoint}/commits/main`,`${endpoint}/license?ref=${revision}`,`${endpoint}/readme?ref=${revision}`]);
+  assert.equal(inspected.repositoryEvidence.length,3);
+  for(const ref of [inspected.metadataEvidence,...inspected.repositoryEvidence]){
+    const retained=store.getEvidence(ref.id),original=documents.get(retained.url);
+    assert.ok(original);assert.equal(retained.body,original.body);
+    assert.equal(retained.sha256,createHash('sha256').update(original.body).digest('hex'));
+    assert.equal(ref.sha256,retained.sha256);
+  }
+  assert.equal(store.getCapability(imported.id).provenance.resolvedRevision,revision);
+});
+
+test('legacy-owner support retains owner length, alphanumeric start and path-component bounds',async t=>{
+  const requests=[],maxOwner='a'.repeat(38)+'-';
+  const {discovery}=await fixture(t,async url=>{
+    requests.push(url);
+    if(url===`https://api.github.com/repos/${maxOwner}/mox`)return json(url,repository(maxOwner,'mox'));
+    assert.equal(new URL(url).hostname,'github.com','Malformed owner must never become an API component');
+    return page(url);
+  });
+  assert.equal((await discovery.importUrl(`https://github.com/${maxOwner}/mox`)).kind,'solution');
+  for(const owner of ['a'.repeat(39)+'-','-mjl','mjl_','mjl-%2Fother','mjl-%5Cother','mjl-%3Fother']){
+    const url=`https://github.com/${owner}/mox`,item=await discovery.importUrl(url);
+    assert.equal(item.kind,'reference');assert.equal(requests.at(-1),url);
+  }
 });
 
 test('blob and tree links preserve exact ref/path as public references rather than collapsing to repository roots',async t=>{

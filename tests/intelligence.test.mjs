@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { createStore } from '../src/store.mjs';
 import { createIntelligence, INTELLIGENCE_SCHEMA } from '../src/intelligence.mjs';
 import { createIntelligenceStore } from '../src/intelligence-store.mjs';
+import { createProviders, measureJevClassificationBatch, JEV_MODEL, CODEX_MODEL } from '../src/providers.mjs';
 
 const directories=[];
 after(async()=>{for(const directory of directories)await rm(directory,{recursive:true,force:true});});
@@ -24,6 +25,26 @@ function fakeProviders(overrides={}) {
     classify:async(provider,input)=>{calls.push({operation:'classify',provider,input});return {results:input.cards.map(result),model:provider==='jev'?'jev-1.13.0':control.model,usage:{inputTokens:100,outputTokens:20}};},
     plan:async(input)=>{calls.push({operation:'plan',input});return {queries:['agent memory'],urls:[],model:control.model,usage:{inputTokens:100,outputTokens:20}};},
     rank:async(provider,input)=>{calls.push({operation:'rank',provider,input});return {results:input.cards.map((card,index)=>({id:card.id,score:1-index/Math.max(input.cards.length,1)})),model:provider==='jev'?'jev-1.13.0':control.model,usage:{inputTokens:100,outputTokens:20}};},...overrides};
+}
+function adapterFixture(overrides={}) {
+  const requests=[];
+  const runner=()=>{throw new Error('No Codex inference in Jev fixtures');};
+  runner.status=async()=>({configured:true,model:CODEX_MODEL});
+  const providers=createProviders({
+    credentialStore:{status:async()=>({configured:true}),load:async()=>'synthetic-test-key'},codexRunner:runner,
+    fetchImpl:async(_,init)=>{
+      const body=JSON.parse(init.body);requests.push(body);
+      assert.ok(Buffer.byteLength(JSON.stringify(body.state))+Math.max(...Object.values(body.questions).map(q=>Buffer.byteLength(JSON.stringify(q))))<=30000);
+      assert.ok(Buffer.byteLength(init.body)<=60000);
+      const answers=Object.fromEntries(Object.entries(body.questions).map(([id,q])=>{
+        if(q.type==='noul')return [id,{type:'noul',noul:0.1}];
+        const keys=Object.keys(q.criteria),choice=keys.includes('whole-product')?'whole-product':'configure-agent';
+        return [id,{type:'choice',choice,confidence:0.9,probabilities:Object.fromEntries(keys.map(key=>[key,key===choice?1:0]))}];
+      }));
+      return new Response(JSON.stringify({model:JEV_MODEL,answers,usage:{input_tokens:1000,output_tokens:100}}),{status:200});
+    },...overrides
+  });
+  return {providers,requests};
 }
 async function setup(t,{providers=fakeProviders(),discovery={}}={}) {
   const directory=await temporary(),store=createStore(directory),engine=createIntelligence({store,discovery,providers,dataDir:directory});
@@ -86,7 +107,7 @@ test('queue serializes work, cancellation prevents queued calls, and deadlines s
 });
 
 test('daily quota and Jev reservation fail closed, while explicit retry can recover a provider failure',async t=>{
-  let paidCalls=0;const providers=fakeProviders({classify:async()=>{paidCalls++;throw new Error('Synthetic provider outage');}});
+  let paidCalls=0;const providers=fakeProviders({classify:async()=>{paidCalls++;throw Object.assign(new Error('Synthetic provider outage'),{code:'INVALID_CARDS',requestSent:false});}});
   const {store,engine}=await setup(t,{providers}),item=candidate(store);
   engine.updateSettings({provider:'jev',jevDailyBudgetUsd:0});
   assert.match((await done(engine,engine.enqueue({type:'classify',candidateIds:[item.id]}))).errors.join(' '),/budget/);assert.equal(paidCalls,0);
@@ -97,6 +118,94 @@ test('daily quota and Jev reservation fail closed, while explicit retry can reco
   providers.classify=fakeProviders().classify;engine.updateSettings({provider:'codex'});
   assert.equal((await done(engine,engine.enqueue({type:'classify',candidateIds:[item.id]}))).status,'completed');
   engine.updateSettings({maxJobsPerDay:4});assert.throws(()=>engine.enqueue({type:'classify',candidateIds:[item.id]}),/Daily.*limit/);
+});
+
+test('verified adapter preflight failures release only their call reservation and retain the job quota',async t=>{
+  const {providers,requests}=adapterFixture(),classify=providers.classify;
+  let rejectLocally=true;
+  // Simulate caller/adapter validation drift: only the adapter's private error
+  // attestation, not a caller-supplied code or property, permits a refund.
+  providers.classify=(provider,input)=>classify(provider,rejectLocally?{...input,cards:[...input.cards,input.cards[0]]}:input);
+  const {store,engine}=await setup(t,{providers}),item=candidate(store);
+  engine.updateSettings({provider:'jev',jevDailyBudgetUsd:0.003,maxJobsPerDay:2});
+  const failed=await done(engine,engine.enqueue({type:'classify',candidateIds:[item.id]}));
+  assert.equal(failed.status,'failed');assert.match(failed.errors.join(' '),/unique bounded IDs/);
+  assert.equal(requests.length,0);assert.equal(failed.usage.length,1);
+  assert.equal(failed.usage[0].requestSent,false);assert.equal(failed.usage[0].chargedOrReservedUsd,0);assert.equal(failed.usage[0].costUsd,0);
+  const usage=(await engine.status()).usageToday;
+  assert.equal(usage.jobs,1);assert.equal(usage.calls,0);assert.equal(usage.localRejections,1);assert.equal(usage.unknownCostCalls,0);assert.equal(usage.jevReservedUsd,0);
+  rejectLocally=false;
+  const retried=await done(engine,engine.enqueue({type:'classify',candidateIds:[item.id]}));
+  assert.equal(retried.status,'completed');assert.equal(requests.length,1);
+  assert.equal((await engine.status()).usageToday.jevReservedUsd,0.000042);
+  assert.throws(()=>engine.enqueue({type:'classify',candidateIds:[item.id]}),/Daily.*limit/);
+});
+
+test('actual Jev network and cancellation failures retain uncertain billing and prevent another call beyond the cap',async t=>{
+  for(const mode of ['network','cancel'])await t.test(mode,async t=>{
+    let calls=0,fetchSignal;
+    const entered=deferred();
+    const {providers}=adapterFixture({fetchImpl:async(_,init)=>{
+      calls++;fetchSignal=init.signal;entered.resolve();
+      if(mode==='network')throw new Error('Synthetic transport interruption');
+      return new Promise(()=>{});
+    }});
+    const {store,engine}=await setup(t,{providers}),item=candidate(store);
+    engine.updateSettings({provider:'jev',jevDailyBudgetUsd:0.003,maxJobsPerDay:2});
+    const initial=engine.enqueue({type:'classify',candidateIds:[item.id]});
+    await entered.promise;
+    if(mode==='cancel')engine.cancel(initial.id);
+    // cancel() acknowledges immediately; wait for the in-flight adapter's
+    // finally block to persist its billing receipt before inspecting it.
+    for(let i=0;i<400&&(await engine.status()).runningJobId===initial.id;i++)await delay(10);
+    const failed=await done(engine,initial);
+    assert.equal(failed.status,mode==='cancel'?'cancelled':'failed');
+    if(mode==='cancel')assert.equal(fetchSignal.aborted,true);
+    assert.equal(failed.usage[0].requestSent,undefined);
+    assert.equal(failed.usage[0].costUsd,null);assert.equal(failed.usage[0].chargedOrReservedUsd,0.002688);
+    const usage=(await engine.status()).usageToday;
+    assert.equal(usage.calls,1);assert.equal(usage.localRejections,0);assert.equal(usage.unknownCostCalls,1);assert.equal(usage.jobs,1);
+    const retry=await done(engine,engine.enqueue({type:'classify',candidateIds:[item.id]}));
+    assert.match(retry.errors.join(' '),/budget/);assert.equal(calls,1);
+    assert.throws(()=>engine.enqueue({type:'classify',candidateIds:[item.id]}),/Daily.*limit/);
+  });
+});
+
+test('enriched Jev cards split by the real request bounds, preserve every ID and charge once per actual request',async t=>{
+  const {providers,requests}=adapterFixture(),{store,engine}=await setup(t,{providers});
+  const ids=[];
+  for(let i=0;i<7;i++){
+    const item=candidate(store,`Enriched ${i}`);
+    const docs=Array.from({length:3},(_,j)=>store.retainEvidence({url:`${item.url}/source-${j}`,body:'Public source. '+'e'.repeat(2100)}));
+    ids.push(store.upsertCapability({...item,description:'d'.repeat(400),metadataEvidence:docs[0],sourceDocumentEvidence:docs[1],registryDocumentEvidence:docs[2]}).item.id);
+  }
+  engine.updateSettings({provider:'jev'});
+  const job=await done(engine,engine.enqueue({type:'classify',candidateIds:ids}));
+  assert.equal(job.status,'completed');assert.equal(job.errors.length,0);
+  const submitted=requests.flatMap(body=>body.state.cards);
+  assert.deepEqual(submitted.map(card=>card.id),job.result.classificationCandidateIds);
+  assert.equal(new Set(submitted.map(card=>card.id)).size,7);
+  const oldBatch=submitted.slice(0,3);
+  assert.ok(Buffer.byteLength(JSON.stringify(oldBatch))<=25000,'Old cards-only check would admit the failing three-card batch');
+  assert.ok(measureJevClassificationBatch(oldBatch).bodyBytes>60000,'The full purpose taxonomy request must split');
+  assert.equal(measureJevClassificationBatch(submitted.slice(0,2)).fits,false,'Two enriched cards also exceed the expanded evidence-criteria bound');
+  assert.deepEqual(requests.map(body=>body.state.cards.length),[1,1,1,1,1,1,1]);
+  assert.equal(job.usage.length,requests.length);
+  assert.equal((await engine.status()).usageToday.jevReservedUsd,requests.length*0.000042);
+  const cached=await done(engine,engine.enqueue({type:'classify',candidateIds:ids}));
+  assert.equal(cached.result.cacheHits,7);assert.equal(cached.usage.length,0);assert.equal(requests.length,7);
+});
+
+test('one source card too large for Jev stays visibly unclassified while other candidates finish without a wasted call',async t=>{
+  const {providers,requests}=adapterFixture(),{store,engine}=await setup(t,{providers});
+  const good=candidate(store,'A usable card'),large=candidate(store,'B oversized card');
+  const docs=Array.from({length:3},(_,j)=>store.retainEvidence({url:`${large.url}/source-${j}`,body:'\u0001'.repeat(2100)}));
+  store.upsertCapability({...large,metadataEvidence:docs[0],sourceDocumentEvidence:docs[1],registryDocumentEvidence:docs[2]});
+  const job=await done(engine,engine.enqueue({type:'classify',provider:'jev',candidateIds:[large.id,good.id]}));
+  assert.equal(job.status,'partial');assert.deepEqual(job.result.assessmentIds,[good.id]);
+  assert.match(job.errors.join(' '),new RegExp(`${large.id}:.*no request sent`));
+  assert.equal(engine.getAssessment(large.id).status,'unclassified');
+  assert.equal(requests.length,1);assert.equal(job.usage.length,1);
 });
 
 test('ranking is cached independently and invalidated by evidence and correction changes without leaking correction notes',async t=>{
@@ -294,10 +403,10 @@ test('classification splits large batches by card count and bytes, including a f
   assert.equal(new Set(calls.flatMap(call=>call.input.cards.map(card=>card.id))).size,23);
   for(const call of calls){assert.ok(call.input.cards.length<=10);assert.ok(Buffer.byteLength(JSON.stringify(call.input.cards))<=55000);}
   const before=providers.calls.length;
-  const jev=await done(engine,engine.enqueue({type:'classify',provider:'jev',candidateIds:ids.slice(0,10)}));
-  assert.equal(jev.status,'completed');assert.equal(jev.result.assessmentIds.length,10);
+  const jev=await done(engine,engine.enqueue({type:'classify',provider:'jev',candidateIds:ids.slice(0,11)}));
+  assert.equal(jev.status,'completed');assert.equal(jev.result.assessmentIds.length,11);
   const jevCalls=providers.calls.slice(before);assert.equal(jevCalls.at(-1).input.cards.length,1);
-  for(const call of jevCalls){assert.ok(call.input.cards.length<=3);assert.ok(Buffer.byteLength(JSON.stringify(call.input.cards))<=25000);}
+  for(const call of jevCalls){assert.ok(call.input.cards.length<=3);assert.equal(measureJevClassificationBatch(call.input.cards).fits,true);}
 });
 
 test('automatic rank shortlist fills with query matches before unrelated whole solutions',async t=>{

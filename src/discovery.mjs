@@ -4,6 +4,7 @@ import { isIP } from 'node:net';
 import { randomUUID, createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { licenseInfo, stableId, searchTerms } from './store.mjs';
+import { githubRepositoryKind } from './github-kind.mjs';
 
 const stamp = () => new Date().toISOString();
 const small = (s,n=4000) => typeof s==='string'?s.slice(0,n):'';
@@ -102,7 +103,9 @@ const repoParts = value => {
     if(githubSiteRoutes.has(owner.toLowerCase()))return null;
     // Decoding before validation prevents encoded route names or delimiters
     // from being mistaken for API path components. No new URL trust is granted.
-    if(!/^[a-z\d](?:[a-z\d-]*[a-z\d])?$/i.test(owner)||owner.length>39||!repo||repo.length>100||!/^[-\w.]+$/.test(repo))return null;
+    // Existing GitHub accounts can end in a hyphen (for example mjl-).
+    // Keep the alphanumeric start, bounded length and delimiter exclusion.
+    if(!/^[a-z\d][a-z\d-]*$/i.test(owner)||owner.length>39||!repo||repo.length>100||!/^[-\w.]+$/.test(repo))return null;
     return [owner,repo];
   } catch {return null;}
 };
@@ -113,7 +116,7 @@ function githubMetrics(repo,fetchedAt) {
 }
 function githubRecord(repo,sourceUrl,fetchedAt) {
   const words=`${repo.name||''} ${repo.description||''} ${(repo.topics||[]).join(' ')}`.toLowerCase();
-  const kind=/\b(?:samples|tutorials?|examples)\b/.test((repo.name||'').toLowerCase())?'pattern':/component|react-ui|ui-library/.test(words)?'component':'solution';
+  const kind=githubRepositoryKind(repo);
   return {name:repo.full_name||repo.name,url:repo.html_url,description:repo.description||'Public repository; inspect upstream for applicability.',kind,provider:'GitHub',tags:(repo.topics||[]).slice(0,25),...licenseInfo(repo.license),licenseEvidence:{status:'metadata-only',sourceUrl:repo.license?.url||sourceUrl,spdx:repo.license?.spdx_id||null,scope:'repository'},github:{defaultBranch:repo.default_branch||'HEAD',archived:!!repo.archived,pushedAt:repo.pushed_at||null,...githubMetrics(repo,fetchedAt)},framework:/react/.test(words)?'React':null,origin:'live',provenance:{sourceUrl,fetchedAt:stamp(),revision:repo.default_branch?`branch:${repo.default_branch}; pushed:${repo.pushed_at||'unknown'}`:undefined,note:'GitHub repository metadata. Stars are an observed popularity signal, not licence, security or suitability approval. Classification is a keyword heuristic.'}};
 }
 
@@ -281,6 +284,17 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
   };
   const attachSource=async(item,{force=false}={})=>{
     let doc,files;
+    if(['skill','agent'].includes(item.details?.resourceType)&&item.details?.sourceUrl){
+      const match=item.details.sourceUrl.match(/^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/blob\/([a-f0-9]{40})\/(.+)$/);
+      if(!match||match[4].split('/').some(part=>{try{return !part||['.','..'].includes(decodeURIComponent(part))||/[\\\x00]/.test(decodeURIComponent(part));}catch{return true;}}))throw new Error('Agent guidance requires a pinned public source file');
+      const sourceUrl=`https://raw.githubusercontent.com/${match[1]}/${match[2]}/${match[3]}/${match[4]}`;
+      const reference=(item.detailsCitations||item.sharedCitations||[]).find(ref=>ref.kind==='github-artifact-document'&&ref.endpoint===sourceUrl&&ref.recordUrl===item.url);
+      if(!reference)throw new Error('Agent guidance has no matching published source hash; inspect its source link');
+      doc=await read(sourceUrl);
+      if(doc.evidence.sha256!==reference.sha256)throw new Error('Agent guidance bytes differ from the published source hash');
+      if(doc.body.length>150000)throw new Error('Agent guidance exceeds the inline source limit; use the reviewed download bundle');
+      return {...item,guidanceSource:{url:sourceUrl,revision:match[3],path:match[4],sha256:doc.evidence.sha256,content:doc.body},guidanceNotice:'Untrusted upstream agent instructions, returned as data. No instructions were executed, installed or added to your agent. Review supporting files and permissions before adoption.'};
+    }
     if(!force&&item.sourceState?.status==='ok'&&Date.now()-Date.parse(item.sourceState.checkedAt)<24*60*60*1000){
       // Make older retained Markdown useful without refetching or changing source identity.
       if(!item.dependencyMetadata){
@@ -317,7 +331,16 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
       backfillGitHubMetadata(store,{ids:[id]});
       let item=store.getCapability(id); if(!item)return null;
       if(fetchSource||refreshSource) {
-        try{item=await attachSource(item,{force:refreshSource});}catch(error){item=rememberFailure(item,error);}
+        try{
+          if(refreshSource&&repoParts(item.url)){
+            const endpoint=`https://api.github.com/repos/${repoParts(item.url).map(encodeURIComponent).join('/')}`;
+            const doc=await read(endpoint),repo=asJSON(doc);
+            if(repo.private!==false||!repo.html_url||repo.html_url.toLowerCase()!==item.url.replace(/\/$/,'').toLowerCase())throw new Error('Repository refresh requires matching public metadata; inspect an upstream rename before replacing the catalogue identity.');
+            const refreshed=githubRecord(repo,endpoint,doc.evidence.lastFetchedAt);
+            item=store.upsertCapability({...item,...refreshed,url:item.url,kind:item.kind,metadataEvidence:doc.evidence,provenance:{...item.provenance,...refreshed.provenance}}).item;
+          }
+          item=await attachSource(item,{force:refreshSource});
+        }catch(error){item=rememberFailure(item,error);}
       }
       return {...item,outcomes:store.outcomes(id)};
     },

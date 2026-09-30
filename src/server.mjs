@@ -3,14 +3,16 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFile, realpath } from 'node:fs/promises';
 import { resolve, dirname, extname, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { createStore, KINDS } from './store.mjs';
+import { createStore, KINDS, RESOURCE_TYPES, resourceTypeOf } from './store.mjs';
 import { seedStore } from './seed.mjs';
 import { createDiscovery } from './discovery.mjs';
 import { compilePreview } from './preview.mjs';
 import { createAdoptionBrief } from './adoption.mjs';
 import { createResearch } from './research.mjs';
+import { createCatalogueRefresh } from './catalogue-refresh.mjs';
 import { createProviders } from './providers.mjs';
 import { createIntelligence } from './intelligence.mjs';
+import { createOnboarding } from './onboarding.mjs';
 
 const root=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const fail=(message,status=400)=>Object.assign(new Error(message),{status});
@@ -41,15 +43,17 @@ async function bodyJSON(req) {
   let body;try{body=JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}');}catch{throw fail('Invalid JSON');}
   if(body===null||typeof body!=='object'||Array.isArray(body))throw fail('JSON body must be an object');return body;
 }
-export async function startServer({port=Number(process.env.GLASSES_PORT||4317),dataDir=process.env.GLASSES_DATA_DIR||resolve(root,'.glasses'),autoScout=process.env.GLASSES_SCOUT_ENABLED!=='false',discoveryFetcher,providers:injectedProviders,seed=true,publicDir=resolve(root,'public')}={}) {
+export async function startServer({port=Number(process.env.GLASSES_PORT||4317),dataDir=process.env.GLASSES_DATA_DIR||resolve(root,'.glasses'),autoScout=process.env.GLASSES_SCOUT_ENABLED!=='false',discoveryFetcher,providers:injectedProviders,seed=true,publicDir=resolve(root,'public'),catalogueFetcher}={}) {
   const store=createStore(dataDir);if(seed)seedStore(store);store.recoverInterruptedRuns();
   const discovery=createDiscovery({store,...(discoveryFetcher?{fetcher:discoveryFetcher}:{})});
   const research=createResearch({store,discovery});
+  const refresh=createCatalogueRefresh({store,discovery});
   const providers=injectedProviders||createProviders({dataDir:store.directory});
   const intelligence=createIntelligence({store,discovery,providers,dataDir:store.directory});
+  const onboarding=createOnboarding({store,...(catalogueFetcher?{fetchImpl:catalogueFetcher}:{})});
   let connectionTest=null;
   const intelligenceStatus=async()=>{const state=await intelligence.status();return {...state,connections:state.providers||await providers.status(),jobs:intelligence.listJobs().items,usage:state.usageToday};};
-  const queueAfterDiscovery=run=>{try{return intelligence.afterDiscovery(run);}catch(error){run.processingError=error.message;store.saveRun(run);return null;}};
+  const queueAfterDiscovery=run=>{if(closed||!run)return null;try{return intelligence.afterDiscovery(run);}catch(error){run.processingError=error.message;store.saveRun(run);return null;}};
   const token=randomBytes(32).toString('hex'), previewNonce=randomBytes(20).toString('base64');let timer=null,closed=false,backoff=1;
   let schedule=store.getSetting('schedule',{enabled:autoScout,intervalMinutes:360});
   if(!autoScout)schedule={...schedule,enabled:false};
@@ -58,8 +62,8 @@ export async function startServer({port=Number(process.env.GLASSES_PORT||4317),d
     if(timer)clearTimeout(timer);timer=null;
     if(closed||!schedule.enabled)return;
     timer=setTimeout(async()=>{
-      if(discovery.scouting){scheduleNext(60000);return;}
-      try{const run=await research.runScheduled();queueAfterDiscovery(run);backoff=run.status==='failed'?Math.min(backoff*2,4):1;}catch{backoff=Math.min(backoff*2,4);}
+      if(discovery.scouting||refresh.running){scheduleNext(60000);return;}
+      try{const run=await research.runScheduled();queueAfterDiscovery(run);if(!closed)queueAfterDiscovery(await refresh.run({trigger:'scheduled'}));backoff=run.status==='failed'?Math.min(backoff*2,4):1;}catch{backoff=Math.min(backoff*2,4);}
       scheduleNext();
     },delay??Math.min(schedule.intervalMinutes*60000*backoff,86400000));timer.unref();
   };
@@ -79,15 +83,16 @@ export async function startServer({port=Number(process.env.GLASSES_PORT||4317),d
         if(supplied.length!==token.length||!timingSafeEqual(Buffer.from(supplied),Buffer.from(token)))throw fail('Missing or invalid X-Glasses-Token; obtain /api/session on loopback',401);
         if(path==='/api/catalog'&&req.method==='GET') {
           const kind=url.searchParams.get('kind')||'all';if(kind!=='all'&&!KINDS.includes(kind))throw fail('Unknown capability kind');
-          const query=(url.searchParams.get('q')||'').slice(0,500),runId=url.searchParams.get('runId');
+          const query=(url.searchParams.get('q')||'').slice(0,500),runId=url.searchParams.get('runId'),parentId=url.searchParams.get('parentId');const resourceType=url.searchParams.get('resourceType')||'all';if(resourceType!=='all'&&!RESOURCE_TYPES.includes(resourceType))throw fail('Unsupported resourceType');if(parentId&&!store.getCapability(parentId))throw fail('Collection parent not found',404);
           const run=runId?store.getRun(runId):null;if(runId&&!run)throw fail('Research run not found',404);
           const ids=runId?new Set(run.candidateIds||[]):null;
           const jobId=url.searchParams.get('jobId'),job=jobId?intelligence.getJob(jobId):null;if(jobId&&!job)throw fail('Processing job not found',404);
           const jobIds=job?new Set(job.candidateIds||[]):null;
           const assessmentStatus=url.searchParams.get('assessmentStatus')||'all';
           if(!['all','unclassified','classified','needs-review','stale','corrected'].includes(assessmentStatus))throw fail('Unknown assessment status');
-          const items=intelligence.decorate(store.search({kind,openSourceOnly:url.searchParams.get('openSourceOnly')==='true'}),{query,artifact:url.searchParams.get('artifact')||'all'}).filter(item=>(!ids||ids.has(item.id))&&(!jobIds||jobIds.has(item.id))&&(assessmentStatus==='all'||item.assessment?.status===assessmentStatus));send(res,200,{items,total:items.length,...(run?{run}:{}),...(job?{job}:{})});return;
+          const items=intelligence.decorate(store.search({kind,openSourceOnly:url.searchParams.get('openSourceOnly')==='true'}),{query,artifact:url.searchParams.get('artifact')||'all'}).filter(item=>(resourceType==='all'||resourceTypeOf(item)===resourceType)&&(!parentId||item.details?.parent?.id===parentId)&&(!ids||ids.has(item.id))&&(!jobIds||jobIds.has(item.id))&&(assessmentStatus==='all'||item.assessment?.status===assessmentStatus));send(res,200,{items,total:items.length,...(run?{run}:{}),...(job?{job}:{})});return;
         }
+        if(path==='/api/onboarding'&&req.method==='GET'){send(res,200,{onboarding:onboarding.status()});return;}
         if(path==='/api/intelligence'&&req.method==='GET'){send(res,200,await intelligenceStatus());return;}
         if(path==='/api/intelligence/jobs'&&req.method==='GET'){const limit=Number(url.searchParams.get('limit')||50),offset=Number(url.searchParams.get('offset')||0);if(!Number.isInteger(limit)||limit<1||limit>100||!Number.isInteger(offset)||offset<0)throw fail('Invalid job pagination');send(res,200,intelligence.listJobs({limit,offset}));return;}
         const jobMatch=path.match(/^\/api\/intelligence\/jobs\/([a-zA-Z0-9-]+)(\/cancel)?$/);
@@ -96,11 +101,12 @@ export async function startServer({port=Number(process.env.GLASSES_PORT||4317),d
         if(assessmentMatch&&req.method==='GET'){if(!store.getCapability(assessmentMatch[1]))throw fail('Capability not found',404);send(res,200,{assessment:intelligence.getAssessment(assessmentMatch[1])});return;}
         if(path==='/api/connections/jev'&&req.method==='DELETE'){if(connectionTest)throw fail('Wait for the current connection test to finish',409);await providers.removeJevKey();send(res,200,{connections:await providers.status({force:true})});return;}
         const capabilityMatch=path.match(/^\/api\/catalog\/([a-zA-Z0-9-]+)$/);
-        if(capabilityMatch&&req.method==='GET') {const item=await discovery.inspect(capabilityMatch[1],{fetchSource:url.searchParams.get('fetchSource')==='true',refreshSource:url.searchParams.get('refreshSource')==='true'});if(!item)throw fail('Capability not found',404);send(res,200,{item:{...item,assessment:intelligence.getAssessment(item.id)}});return;}
+        if(capabilityMatch&&req.method==='GET') {const item=await discovery.inspect(capabilityMatch[1],{fetchSource:url.searchParams.get('fetchSource')==='true',refreshSource:url.searchParams.get('refreshSource')==='true'});if(!item)throw fail('Capability not found',404);send(res,200,{item:{...item,assessment:intelligence.getAssessment(item.id)},...(item.details?.memberCount?{collection:{parentId:item.id,publishedMembers:item.details.memberCount,browse:{tool:'glasses_search',arguments:{query:'',parentId:item.id,limit:20,offset:0}},note:'Published membership may differ from current local records; search returns the current local total.'}}:{})});return;}
         const evidenceMatch=path.match(/^\/api\/evidence\/([a-zA-Z0-9-]+)$/);
         if(evidenceMatch&&req.method==='GET'){const evidence=store.getEvidence(evidenceMatch[1]);if(!evidence)throw fail('Evidence not found',404);send(res,200,{evidence});return;}
         if(path==='/api/status'&&req.method==='GET'){const runs=store.runs();send(res,200,{counts:store.counts(),sources:store.sources(),lastRun:runs[0]||null,runs,scouting:discovery.scouting,schedule:{...schedule,note:'Runs only while the local Glasses server is running; no operating-system scheduler is installed.'}});return;}
         if(path==='/api/research/plans'&&req.method==='GET'){send(res,200,{items:store.researchPlans()});return;}
+        if(path==='/api/catalogue-refresh'&&req.method==='GET'){send(res,200,refresh.status());return;}
         const researchPlanMatch=path.match(/^\/api\/research\/plans\/([a-zA-Z0-9-]+)(\/run)?$/);
         if(researchPlanMatch&&!researchPlanMatch[2]&&req.method==='GET'){const plan=store.getResearchPlan(researchPlanMatch[1]);if(!plan)throw fail('Research plan not found',404);send(res,200,{plan});return;}
         if(path==='/api/research/runs'&&req.method==='GET'){
@@ -113,6 +119,12 @@ export async function startServer({port=Number(process.env.GLASSES_PORT||4317),d
         const researchRunMatch=path.match(/^\/api\/research\/runs\/([a-zA-Z0-9-]+)$/);
         if(researchRunMatch&&req.method==='GET'){const run=store.getRun(researchRunMatch[1]);if(!run)throw fail('Research run not found',404);send(res,200,{run});return;}
         if(path==='/api/workspaces'&&req.method==='GET'){send(res,200,{items:store.workspaces()});return;}
+        if(path==='/api/design-reviews'&&req.method==='GET'){send(res,200,{items:store.designReviews()});return;}
+        const designReviewMatch=path.match(/^\/api\/design-reviews\/([a-zA-Z0-9-]+)(\/decision)?$/);
+        if(designReviewMatch&&!designReviewMatch[2]&&req.method==='GET'){
+          const review=store.getDesignReview(designReviewMatch[1]);if(!review)throw fail('Design review not found',404);
+          send(res,200,{review});return;
+        }
         const workspaceMatch=path.match(/^\/api\/workspaces\/([a-zA-Z0-9-]+)(\/export)?$/);
         if(workspaceMatch&&req.method==='GET') {
           const workspace=store.getWorkspace(workspaceMatch[1]);if(!workspace)throw fail('Workspace not found',404);
@@ -127,6 +139,15 @@ export async function startServer({port=Number(process.env.GLASSES_PORT||4317),d
         }
         if(['POST','PUT'].includes(req.method)) {
           const body=await bodyJSON(req);
+          if(path==='/api/catalogue-refresh'&&req.method==='PUT'){send(res,200,refresh.configure(body));return;}
+          if(path==='/api/catalogue-refresh'&&req.method==='POST'){if(Object.keys(body).some(key=>key!=='ids'))throw fail('Refresh accepts only optional ids');const run=await refresh.run({ids:body.ids});queueAfterDiscovery(run);send(res,200,{run,...refresh.status()});return;}
+          if(path==='/api/design-reviews'&&req.method==='POST'){send(res,201,{review:store.createDesignReview(body)});return;}
+          if(designReviewMatch&&((!designReviewMatch[2]&&req.method==='PUT')||(designReviewMatch[2]&&req.method==='POST'))){
+            const review=designReviewMatch[2]?store.decideDesignReview(designReviewMatch[1],body):store.updateDesignReview(designReviewMatch[1],body);
+            if(!review)throw fail('Design review not found',404);send(res,200,{review});return;
+          }
+          if(path==='/api/onboarding'&&req.method==='POST'){send(res,200,{onboarding:await onboarding.choose(body)});return;}
+          if(path==='/api/onboarding/import'&&req.method==='POST'){send(res,200,{onboarding:await onboarding.importLatest(body)});return;}
           if(path==='/api/intelligence/settings'&&req.method==='PUT'){send(res,200,{settings:intelligence.updateSettings(body)});return;}
           if(path==='/api/intelligence/jobs'&&req.method==='POST'){send(res,202,{job:intelligence.enqueue(body)});return;}
           if(jobMatch&&jobMatch[2]&&req.method==='POST'){if(Object.keys(body).length)throw fail('Cancel takes an empty body');const job=intelligence.cancel(jobMatch[1]);if(!job)throw fail('Processing job not found',404);send(res,200,{job});return;}
@@ -141,10 +162,10 @@ export async function startServer({port=Number(process.env.GLASSES_PORT||4317),d
             connectionTest=new AbortController();
             try{send(res,200,{result:await providers.test(testMatch[1],{signal:connectionTest.signal,timeoutMs:60000})});}finally{connectionTest=null;}return;
           }
-          if(path==='/api/scout'&&req.method==='POST'){stringField(body.query,'query',200);const run=await discovery.scout({query:body.query});queueAfterDiscovery(run);scheduleNext();send(res,200,run);return;}
+          if(path==='/api/scout'&&req.method==='POST'){if(refresh.running)throw fail('Catalogue refresh is running; retry after it finishes',409);stringField(body.query,'query',200);const run=await discovery.scout({query:body.query});queueAfterDiscovery(run);scheduleNext();send(res,200,run);return;}
           if(path==='/api/research/plans'&&req.method==='POST'){send(res,201,{plan:store.createResearchPlan(body)});return;}
           if(researchPlanMatch&&!researchPlanMatch[2]&&req.method==='PUT'){const plan=store.updateResearchPlan(researchPlanMatch[1],body);if(!plan)throw fail('Research plan not found',404);send(res,200,{plan});return;}
-          if(researchPlanMatch&&researchPlanMatch[2]&&req.method==='POST'){if(Object.keys(body).length)throw fail('Run uses the saved plan; request body must be empty');const run=await research.runPlan(researchPlanMatch[1]);queueAfterDiscovery(run);scheduleNext();send(res,200,run);return;}
+          if(researchPlanMatch&&researchPlanMatch[2]&&req.method==='POST'){if(refresh.running)throw fail('Catalogue refresh is running; retry after it finishes',409);if(Object.keys(body).length)throw fail('Run uses the saved plan; request body must be empty');const run=await research.runPlan(researchPlanMatch[1]);queueAfterDiscovery(run);scheduleNext();send(res,200,run);return;}
           if(path==='/api/import'&&req.method==='POST'){stringField(body.url,'url',4000,false);const item=await discovery.importUrl(body.url);send(res,200,{item});return;}
           if(path==='/api/settings'&&req.method==='POST') {
             if(typeof body.scoutEnabled!=='boolean'||!Number.isInteger(body.intervalMinutes)||body.intervalMinutes<5||body.intervalMinutes>10080)throw fail('scoutEnabled must be boolean; intervalMinutes must be an integer between 5 and 10080');
@@ -173,12 +194,12 @@ export async function startServer({port=Number(process.env.GLASSES_PORT||4317),d
       if(!actual.startsWith(allowedRoot))throw fail('Path blocked',403);
       const bytes=await readFile(actual);
       res.writeHead(200,{'Content-Type':types[extname(fullPath)],'Cache-Control':'no-cache','X-Content-Type-Options':'nosniff','Content-Security-Policy':`default-src 'self'; script-src 'self' 'nonce-${previewNonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'`});res.end(req.method==='HEAD'?undefined:bytes);
-    } catch(error) {if(!res.headersSent)send(res,error.status||400,{error:error.message||'Request failed'});else res.end();}
+    } catch(error) {if(!res.headersSent)send(res,error.status||400,{error:error.message||'Request failed',...(error.onboarding?{onboarding:error.onboarding}:{})});else res.end();}
   });
   server.requestTimeout=30000;server.headersTimeout=10000;server.timeout=180000;
   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,'127.0.0.1',resolve);});
   const actualPort=server.address().port;scheduleNext(1500);
-  return {server,store,discovery,research,intelligence,providers,port:actualPort,url:`http://127.0.0.1:${actualPort}`,async close(){closed=true;if(timer)clearTimeout(timer);connectionTest?.abort();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await intelligence.close();await discovery.whenIdle();store.close();}};
+  return {server,store,discovery,research,refresh,intelligence,providers,onboarding,port:actualPort,url:`http://127.0.0.1:${actualPort}`,async close(){closed=true;if(timer)clearTimeout(timer);connectionTest?.abort();await onboarding.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await refresh.close();await intelligence.close();await discovery.whenIdle();store.close();}};
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(resolve(process.argv[1])).href) {
   startServer().then(app=>{

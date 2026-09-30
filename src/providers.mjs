@@ -5,13 +5,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { createCredentialStore, credentialError } from './credential-store.mjs';
+import { CLASSIFICATION_POLICY } from './classification-policy.mjs';
+export { CLASSIFICATION_POLICY } from './classification-policy.mjs';
 
 export const JEV_MODEL = 'jev-1.13.0';
 export const CODEX_MODEL = 'gpt-6-luna';
+// Independent from the persisted result shape: changing purpose criteria must
+// invalidate old source-identical classifications and caches without deleting them.
 export const ARTIFACTS = ['whole-product', 'tool-library', 'agent-extension', 'memory-engine', 'replacement-agent', 'component', 'pattern', 'reference', 'unknown'];
-export const ADOPTIONS = ['configure-agent', 'deploy-service', 'embed-package', 'adapt-source', 'replace-workflow', 'reference', 'unknown'];
+export const ADOPTIONS = ['configure-agent', 'deploy-service', 'embed-package', 'adapt-source', 'replace-workflow', 'reference', 'unknown', 'install-app', 'run-cli', 'use-hosted', 'integrate-api', 'browser-extension'];
 const ARTIFACT_CRITERIA = {
-  'whole-product': 'A complete installable/deployable solution to a user problem, with its own integration and lifecycle.',
+  'whole-product': 'A complete end-user application or service solving a user problem, whether installed, self-hosted or used through a documented hosted offering.',
   'tool-library': 'A reusable package, framework, focused tool or collection/library of components consumed by another application. Classify a collection overview as a library, not as one of its individual components.',
   'agent-extension': 'A skill, plugin, MCP server or extension adding capabilities to an existing agent.',
   'memory-engine': 'A memory/storage/retrieval engine requiring an integrator to build the agent lifecycle around it.',
@@ -22,14 +26,75 @@ const ARTIFACT_CRITERIA = {
 };
 const ADOPTION_CRITERIA = {
   'configure-agent': 'Install/configure a capability on an existing agent, preserving that agent.',
-  'deploy-service': 'Run an independently deployed application or service.',
+  'deploy-service': 'Self-host an independently deployed application or service when documented as a primary use route. This describes installation, NOT its purpose; a self-hosted document editor is still for document editing, not deployment management.',
   'embed-package': 'Import a distributed library/engine package into application code and integrate its lifecycle. Prefer this only when package/import adoption is supported; a registry source item alone does not establish it.',
   'adapt-source': 'Copy or adapt source, a source-distribution registry component/block, or an implementation pattern. Distinguish copying editable source from importing a distributed runtime package; use unknown if the route is unsupported.',
-  'replace-workflow': 'Move to a replacement agent/product workflow.',
+  'replace-workflow': 'Replace the existing agent or substantive working process with this product. Do not choose merely because using any new tool changes a habit; prefer its explicit installed/hosted/CLI/integration route when that is the documented adoption.',
   reference: 'Read or inspect as a reference; no direct executable adoption.',
-  unknown: 'Insufficient evidence to determine the adoption route.'
+  unknown: 'Insufficient evidence to determine the adoption route.',
+  'install-app': 'Install and use a complete desktop or mobile application. Require a documented app distribution; a web server or package installation command alone is insufficient.',
+  'run-cli': 'Run a command-line tool to perform the user task. An npm/docker command that merely installs or starts a web app does not make that app a CLI tool.',
+  'use-hosted': 'Use the documented hosted application in a browser/account without running its server. A project homepage, screenshot or temporary demo alone does not establish a hosted service.',
+  'integrate-api': 'Connect an application to a documented service API as the adoption route. Incidental internal endpoints or having a REST API alongside a full app are insufficient by themselves.',
+  'browser-extension': 'Install a documented browser add-on/extension. A browser-based web app or ordinary JavaScript library is not a browser extension.'
 };
-export const CAPABILITIES = ['agent-memory', 'semantic-search', 'agent-tools', 'mcp', 'browser-automation', 'coding', 'workflow-automation', 'data-extraction', 'classification', 'ranking', 'ui-components', 'visual-design', 'animation', 'documentation', 'testing', 'authentication', 'storage', 'observability', 'deployment', 'local-first'];
+// Product purpose comes from explicit public evidence, not implementation
+// ingredients, README boilerplate, distribution method or inferred popularity.
+export const CAPABILITY_CRITERIA = Object.freeze({
+  'agent-memory': 'Persist, recall or manage agent context across sessions as a product capability; a database dependency or chat history alone is insufficient.',
+  'semantic-search': 'Offer meaning-based retrieval/search to users or integrators; not a generic search box or an incidental vector dependency.',
+  'agent-tools': 'Provide executable tools/integrations used by an agent; agent-themed UI or prose about AI is insufficient.',
+  mcp: 'Provide or consume the Model Context Protocol as an explicit supported integration; not a mention in a roadmap or comparison.',
+  'browser-automation': 'Programmatically control browser tasks/pages as a supported function; simply running in a browser is insufficient.',
+  coding: 'Help users author, edit, analyze or generate software code; not merely being implemented in code or accepting contributions.',
+  'workflow-automation': 'Let users orchestrate or automate multi-step tasks/integrations; a build script or ordinary app request lifecycle is insufficient.',
+  'data-extraction': 'Extract structured information from documents, websites or other inputs for users; not merely reading its own configuration.',
+  classification: 'Offer classification of user data/content as a product function; not tags in its own README or this catalogue assessment.',
+  ranking: 'Score or order user-supplied candidates/search results as a supported function; not a sorted table alone.',
+  'ui-components': 'Supply reusable interface source/components or a UI component library; having an app interface is insufficient.',
+  'visual-design': 'Help create or edit visual designs, layouts, graphics or prototypes; a visually polished app alone is insufficient.',
+  animation: 'Provide animation authoring, effects or reusable motion behavior; incidental transitions in an app are insufficient.',
+  documentation: 'Help users author, organize, generate or publish documentation; merely shipping a README, installation guide or API docs is insufficient.',
+  testing: 'Offer software test creation, execution, management or validation to users; its own tests or CI badge are insufficient.',
+  authentication: 'Provide identity, authentication, authorization or SSO as a primary reusable service/tool; an app login screen alone is insufficient.',
+  storage: 'Provide data/object/file storage infrastructure or storage management as a user/integrator function; using SQLite or saving its own state is insufficient.',
+  observability: 'Help users monitor, trace, log or diagnose running systems; incidental application logs are insufficient.',
+  deployment: 'Legacy deployment-management alias retained for older records. Do not emit it for new classifications; use deployment-management when supported.',
+  'local-first': 'Explicitly support on-device/offline ownership and operation of primary user data; self-hostable, Docker installable or open source alone is insufficient.',
+  'document-editing': 'Create, edit, format or review documents/text for users; a README, source-code editor or read-only document viewer alone is insufficient.',
+  'real-time-collaboration': 'Support multiple users concurrently editing or working with shared live state; login/accounts or asynchronous file sharing alone is insufficient.',
+  'knowledge-management': 'Organize, retrieve and maintain a reusable body of knowledge for users/teams; incidental project documentation is insufficient.',
+  wiki: 'Provide linked collaborative wiki pages/knowledge spaces as an explicit function; a single Markdown README is insufficient.',
+  scheduling: 'Manage appointments, calendars, availability, reservations or staff schedules for users; internal cron jobs alone are insufficient.',
+  helpdesk: 'Manage customer support tickets, shared support inboxes or service requests; a project issue tracker link alone is insufficient.',
+  communication: 'Provide user/team chat, messaging, calls or conferencing; a community chat link is insufficient.',
+  email: 'Provide email inbox, server, client or email campaign functionality; sending transactional sign-in emails alone is insufficient.',
+  'project-management': 'Plan, coordinate and track projects, milestones or team delivery; a repository project board link is insufficient.',
+  'task-management': 'Manage users\' tasks, to-dos or personal/team work queues; an internal job queue alone is insufficient.',
+  crm: 'Manage customer relationships, leads, contacts or sales pipelines as a core business function.',
+  accounting: 'Manage financial books, ledgers, expenses, reconciliation or accounting reports; accepting payments alone is insufficient.',
+  invoicing: 'Create/manage invoices, quotes, billing or subscriptions for users; a pricing page alone is insufficient.',
+  inventory: 'Manage stock, warehouses, assets or supply inventory as a business function; listing files or software packages alone is insufficient.',
+  ecommerce: 'Operate an online store, product catalogue, cart, checkout or order-management system; a checkout UI snippet alone is insufficient.',
+  'forms-surveys': 'Create, collect or analyze form/survey responses; ordinary app settings/input fields are insufficient.',
+  'product-analytics': 'Analyze product/web usage, events, sessions, funnels, cohorts or retention; operational logs and event-ticket sales alone are insufficient.',
+  'business-intelligence': 'Query/explore business datasets or build analytical reports/dashboards for decision-making; a fixed admin dashboard alone is insufficient.',
+  'content-management': 'Author, manage and publish site/application content through a CMS or comparable workflow; merely displaying content is insufficient.',
+  'digital-assets': 'Organize, version, find or distribute reusable images/design/media assets; a folder of its own icons is insufficient.',
+  'media-management': 'Organize, play, stream or manage photo/audio/video collections; a decorative hero image is insufficient.',
+  'file-sync-sharing': 'Synchronize or share user files across devices/people; storing its own application files is insufficient.',
+  'backup-recovery': 'Back up, restore or recover user/system data as a function; suggesting users back up before installing is insufficient.',
+  'password-management': 'Store, generate or manage user credentials/password vaults; a password login field alone is insufficient.',
+  'secrets-management': 'Manage application secrets, credentials or keys for other systems; needing its own API key is insufficient.',
+  'deployment-management': 'Build, release, deploy, host or operate other applications/infrastructure as a product function; a self-hosting guide or Dockerfile does not qualify.',
+  'infrastructure-management': 'Provision, configure or administer infrastructure/environments for users; merely requiring infrastructure is insufficient.',
+  'database-management': 'Operate, administer, query, migrate or manage databases as a user-facing tool/service; using a database internally is insufficient.',
+  'api-development': 'Help design, test, document, expose or manage APIs as the product purpose; having its own API does not qualify.',
+  'data-integration': 'Move, transform or synchronize data between external systems as a supported function; its own persistence layer is insufficient.',
+  'data-visualization': 'Create reusable charts or interactive visual representations of supplied data; a fixed usage counter alone is insufficient.',
+  'office-productivity': 'Offer office work such as documents, spreadsheets, presentations or an integrated office suite; general claims of productivity are insufficient.'
+});
+export const CAPABILITIES = Object.keys(CAPABILITY_CRITERIA);
 const ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
 const MODEL_ENDPOINT = 'https://api.typesafe.ai/v1/models';
 const MAX_RESPONSE_BYTES = 1024 * 1024;
@@ -60,7 +125,7 @@ const tokenSchema = z.number().int().min(0).max(1e9);
 const usageSchema = z.object({ inputTokens: tokenSchema, outputTokens: tokenSchema, costUsd: z.number().min(0).max(1e6).optional() });
 const resultSchema = z.object({
   id: z.string().min(1).max(200), artifact: z.enum(ARTIFACTS), adoption: z.enum(ADOPTIONS),
-  capabilities: z.array(z.string().min(1).max(80)).max(20), confidence: z.number().min(0).max(1),
+  capabilities: z.array(z.enum(CAPABILITIES.filter(capability=>capability!=='deployment'))).max(20), confidence: z.number().min(0).max(1),
   evidenceIds: z.array(z.string().min(1).max(200)).max(20)
 }).strict();
 const classificationSchema = z.object({ results: z.array(resultSchema).max(20) }).strict();
@@ -68,6 +133,11 @@ const rankingSchema = z.object({ results: z.array(z.object({ id: z.string().min(
 const planSchema = z.object({ queries: z.array(z.string().min(1).max(200)).min(1).max(2), urls: z.array(z.string().url().max(2048)).max(2) }).strict();
 
 function failure(code, message) { return credentialError(code, message); }
+// Only this adapter can attest that no upstream request was started. A copied
+// error code or requestSent property is insufficient to release a reservation.
+const definitelyUnsentErrors = new WeakSet();
+function markUnsent(error) { if (error && typeof error === 'object') definitelyUnsentErrors.add(error); return error; }
+export function isDefinitelyUnsentProviderError(error) { return definitelyUnsentErrors.has(error); }
 export function codexTurnFailure(error) {
   // Upstream text can contain source content, account IDs or credentials. Only
   // recognize fixed categories/keywords; never forward arbitrary message text.
@@ -158,6 +228,28 @@ function publicCards(input, limit = 20) {
 // the original IDs locally. Keep ONE upstream request per provider invocation:
 // the intelligence engine reserves and records usage at that exact boundary.
 function jsonBytes(value) { return Buffer.byteLength(JSON.stringify(value)); }
+function jevRequestSize(body) {
+  const stateBytes = jsonBytes(body.state);
+  const longestQuestionBytes = Math.max(0, ...Object.values(body.questions).map(jsonBytes));
+  const bodyBytes = jsonBytes(body);
+  return { stateBytes, longestQuestionBytes, bodyBytes, fits: stateBytes + longestQuestionBytes <= 30000 && bodyBytes <= 60000 };
+}
+function jevClassificationRequest(cards) {
+  const questions = {};
+  cards.forEach((card, i) => {
+    const prefix = `${PUBLIC_INSTRUCTIONS} Evaluate only state.cards[${i}] (${card.id}). `;
+    questions[`a${i}`] = { type: 'choice', instructions: prefix + 'Choose the primary artifact kind; unknown if unsupported.', criteria: ARTIFACT_CRITERIA };
+    questions[`d${i}`] = { type: 'choice', instructions: prefix + 'Choose one primary evidenced adoption route, independently of product purpose. Prefer the documented user quick-start route; unknown if unsupported. Multiple routes may exist; this is not an exhaustive inventory.', criteria: ADOPTION_CRITERIA };
+    CAPABILITIES.forEach((capability, j) => { questions[`c${i}_${j}`] = { type: 'noul', instructions: prefix + `Does the evidence support the product capability '${capability}'? Criterion: ${CAPABILITY_CRITERIA[capability]} Answer false for incidental implementation, installation steps or boilerplate.` }; });
+  });
+  return { model: JEV_MODEL, state: { cards }, questions };
+}
+// The engine measures the same public projection, questions and UTF-8 JSON that
+// will be submitted. Counting card bytes alone omits the full purpose taxonomy.
+export function measureJevClassificationBatch(input) {
+  try { return jevRequestSize(jevClassificationRequest(publicCards(input))); }
+  catch (error) { throw markUnsent(error); }
+}
 function fitJSONText(value, extraBytes) {
   const chars = Array.from(typeof value === 'string' ? value : '');
   let low = 0, high = chars.length;
@@ -401,14 +493,17 @@ export function createProviders({ dataDir, fetchImpl = globalThis.fetch, codexRu
   }
   async function callJev(body, options, listing = false) {
     if (!listing) {
-      const stateSize = Buffer.byteLength(JSON.stringify(body.state));
-      const longestQuestion = Math.max(0, ...Object.values(body.questions).map(question => Buffer.byteLength(JSON.stringify(question))));
-      if (stateSize + longestQuestion > 30000 || Buffer.byteLength(JSON.stringify(body)) > 60000) throw failure('INVALID_CARDS', 'Jev batch exceeds the conservative context bound; split it into smaller batches.');
+      if (!jevRequestSize(body).fits) throw markUnsent(failure('INVALID_CARDS', 'Jev batch exceeds the conservative context bound; split it into smaller batches.'));
     }
-    return bounded(async signal => {
+    let requestStarted = false;
+    try { return await bounded(async signal => {
       const key = await credentials.load();
       if (!key) throw failure('NOT_CONFIGURED', 'Add your Jev API key in Connections first.');
+      // A timed-out credential lookup must not send a request after its caller
+      // has settled (and potentially released the unsent reservation).
+      if (signal.aborted) throw failure('ABORTED', 'Provider request cancelled.');
       let response;
+      requestStarted = true;
       try { response = await fetchImpl(listing ? MODEL_ENDPOINT : ENDPOINT, { method: listing ? 'GET' : 'POST', redirect: 'error',
         headers: { Authorization: `Bearer ${key}`, ...(listing ? {} : { 'Content-Type': 'application/json' }) },
         ...(listing ? {} : { body: JSON.stringify(body) }), signal }); }
@@ -419,7 +514,8 @@ export function createProviders({ dataDir, fetchImpl = globalThis.fetch, codexRu
         throw failure(`JEV_HTTP_${response.status}`, messages[response.status] || 'Jev returned an upstream error. Try again later.');
       }
       try { return await readJSON(response); } catch { throw malformed(); }
-    }, options);
+    }, options); }
+    catch (error) { throw requestStarted ? error : markUnsent(error); }
   }
   async function callCodex(prompt, schema, options = {}) {
     return bounded(async signal => {
@@ -474,24 +570,21 @@ export function createProviders({ dataDir, fetchImpl = globalThis.fetch, codexRu
       return { ok: true, provider, model: result.model, inference: false, usage: { inputTokens: 0, outputTokens: 0 }, diagnostics: result.diagnostics, message: 'Saved Codex sign-in and isolated worker setup verified; no inference requested.' };
     },
     async classify(provider, { cards: input, model, ...options }) {
-      const expectedModel = modelFor(provider);
-      if (model && model !== expectedModel) throw failure('INVALID_MODEL', `This provider is pinned to ${expectedModel}.`);
-      const cards = publicCards(input);
+      let cards;
+      try {
+        const expectedModel = modelFor(provider);
+        if (model && model !== expectedModel) throw failure('INVALID_MODEL', `This provider is pinned to ${expectedModel}.`);
+        cards = publicCards(input);
+      } catch (error) { throw markUnsent(error); }
       if (provider === 'codex') {
-        const result = await callCodex(`${PUBLIC_INSTRUCTIONS}\nClassify every card exactly once. Artifact criteria=${JSON.stringify(ARTIFACT_CRITERIA)}. Adoption criteria=${JSON.stringify(ADOPTION_CRITERIA)}. Distinguish complete products from engines and replacement agents. capabilities are short descriptive labels (max20). confidence is 0..1 for evidence support. evidenceIds must be supporting IDs from that card only; never invent references.\nPUBLIC_CARDS=${JSON.stringify(cards)}`, classificationSchema, options);
+        const result = await callCodex(`${PUBLIC_INSTRUCTIONS}\nClassification policy=${CLASSIFICATION_POLICY}. Classify every card exactly once. Artifact criteria=${JSON.stringify(ARTIFACT_CRITERIA)}. Adoption criteria=${JSON.stringify(ADOPTION_CRITERIA)}. Choose one primary documented adoption route independently of what the product does. A self-hosted editor has document-editing purpose; deploy-service is only its installation route. Distinguish complete products from engines and replacement agents. Capability criteria=${JSON.stringify(CAPABILITY_CRITERIA)}. Return at most20 strongest explicitly supported capability IDs; incidental implementation dependencies, a README, tests, login or Docker installation do not establish their respective product capabilities. confidence is 0..1 for evidence support. evidenceIds must be supporting IDs from that card only; never invent references.\nPUBLIC_CARDS=${JSON.stringify(cards)}`, classificationSchema, options);
         validateMembership(result.results, cards, true); return result;
       }
-      const questions = {};
-      cards.forEach((card, i) => {
-        const prefix = `${PUBLIC_INSTRUCTIONS} Evaluate only state.cards[${i}] (${card.id}). `;
-        questions[`a${i}`] = { type: 'choice', instructions: prefix + 'Choose the primary artifact kind; unknown if unsupported.', criteria: ARTIFACT_CRITERIA };
-        questions[`d${i}`] = { type: 'choice', instructions: prefix + 'Choose the primary way a user would adopt it; unknown if unsupported.', criteria: ADOPTION_CRITERIA };
-        CAPABILITIES.forEach((capability, j) => { questions[`c${i}_${j}`] = { type: 'noul', instructions: prefix + `Does the evidence support the capability '${capability}'?` }; });
-      });
-      const response = await callJev({ model: JEV_MODEL, state: { cards }, questions }, options);
+      const body = jevClassificationRequest(cards), { questions } = body;
+      const response = await callJev(body, options);
       const metadata = jevResponse(response, questions);
       const results = cards.map((card, i) => ({ id: card.id, artifact: response.answers[`a${i}`].choice, adoption: response.answers[`d${i}`].choice,
-        capabilities: CAPABILITIES.filter((_, j) => response.answers[`c${i}_${j}`].noul >= 0.8),
+        capabilities: CAPABILITIES.map((capability,j)=>({capability,index:j,support:response.answers[`c${i}_${j}`].noul})).filter(x=>x.support>=0.8&&x.capability!=='deployment').sort((a,b)=>b.support-a.support||a.index-b.index).slice(0,20).map(x=>x.capability),
         confidence: Math.min(response.answers[`a${i}`].confidence, response.answers[`d${i}`].confidence), evidenceIds: card.evidenceIds }));
       return { ...parse(classificationSchema, { results }), ...metadata };
     },
@@ -502,9 +595,12 @@ export function createProviders({ dataDir, fetchImpl = globalThis.fetch, codexRu
       return result;
     },
     async rank(provider, { query, cards: input, ...options }) {
-      modelFor(provider);
-      if (typeof query !== 'string' || !query.trim() || query.length > 2000) throw failure('INVALID_QUERY', 'Ranking query must contain 1–2000 characters.');
-      const cards = publicCards(input, 30);
+      let cards;
+      try {
+        modelFor(provider);
+        if (typeof query !== 'string' || !query.trim() || query.length > 2000) throw failure('INVALID_QUERY', 'Ranking query must contain 1–2000 characters.');
+        cards = publicCards(input, 30);
+      } catch (error) { throw markUnsent(error); }
       if (provider === 'codex') {
         const result = await callCodex(`${PUBLIC_INSTRUCTIONS}\nScore each public card exactly once for relevance to the user's goal: 0 is unrelated; 1 directly solves the goal with evidence. Prefer an existing whole solution when it fits.\nUSER_QUERY=${JSON.stringify(query)}\nPUBLIC_CARDS=${JSON.stringify(cards)}`, rankingSchema, options);
         validateMembership(result.results, cards); return result;

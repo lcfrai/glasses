@@ -4,7 +4,7 @@ import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCredentialStore } from '../src/credential-store.mjs';
-import { createProviders, JEV_MODEL, CODEX_MODEL, CODEX_RESTRICTIONS, codexTurnFailure } from '../src/providers.mjs';
+import { createProviders, JEV_MODEL, CODEX_MODEL, CODEX_RESTRICTIONS, codexTurnFailure, measureJevClassificationBatch, isDefinitelyUnsentProviderError } from '../src/providers.mjs';
 
 const cards = [{ id: 'graft', name: 'Graft', url: 'https://github.com/papercomputeco/graft', description: 'Complete local agent memory system with Codex hooks and an MCP server. SQLite-backed, supports persistence and recall.', evidenceIds: ['readme'], evidence: [{ id: 'readme', sha256: 'a'.repeat(64), url: 'https://github.com/papercomputeco/graft', excerpt: 'Persistent agent memory with recall hooks and local storage.' }], privateWorkspace: 'DO_NOT_SEND_PRIVATE', apiKey: 'DO_NOT_SEND_KEY' }];
 const classified = { id: 'graft', artifact: 'whole-product', adoption: 'configure-agent', capabilities: ['agent-memory', 'mcp'], confidence: 0.9, evidenceIds: ['readme'] };
@@ -248,6 +248,50 @@ test('invalid batches and provider/model names fail before any upstream call', a
   await assert.rejects(providers.classify('other', { cards }), { code: 'INVALID_PROVIDER' });
   await assert.rejects(providers.classify('jev', { cards, model: 'other' }), { code: 'INVALID_MODEL' });
   await assert.rejects(providers.plan({ query: '' }), { code: 'INVALID_QUERY' });
+});
+
+test('Jev measures actual projected question overhead and rejects oversize requests before credentials or fetch', async t => {
+  const enriched = Array.from({ length: 3 }, (_, index) => ({
+    id: `source-${index}`, name: `Repository ${index}`, description: 'd'.repeat(1200),
+    evidenceIds: [0, 1, 2].map(n => `readme-${index}-${n}`),
+    evidence: [0, 1, 2].map(n => ({ id: `readme-${index}-${n}`, url: `https://example.org/${index}/${n}`, excerpt: 'e'.repeat(2000) })),
+    privateNote: 'DO_NOT_SEND'
+  }));
+  assert.ok(Buffer.byteLength(JSON.stringify(enriched)) < 25000, 'The old cards-only threshold admits this real-shaped batch');
+  const oversized = measureJevClassificationBatch(enriched);
+  assert.ok(oversized.bodyBytes > 60000);
+  assert.equal(oversized.fits, false);
+  let loads = 0, fetches = 0, actual;
+  const { providers } = await setup(t, {
+    credentialStore: { load: async () => { loads++; return fixtureKey; } },
+    fetchImpl: async (_, init) => { fetches++; actual = JSON.parse(init.body); return json(jevReply(actual)); }
+  });
+  await assert.rejects(providers.classify('jev', { cards: enriched }), error => error.code === 'INVALID_CARDS' && isDefinitelyUnsentProviderError(error));
+  assert.equal(loads, 0); assert.equal(fetches, 0);
+  const fitting = enriched.slice(0, 1);
+  fitting[0] = { ...fitting[0], description: '界\\\"'.repeat(350) };
+  const measured = measureJevClassificationBatch(fitting);
+  assert.equal(measured.fits, true);
+  await providers.classify('jev', { cards: fitting });
+  assert.equal(fetches, 1);
+  assert.equal(measured.bodyBytes, Buffer.byteLength(JSON.stringify(actual)));
+  assert.equal(measured.stateBytes, Buffer.byteLength(JSON.stringify(actual.state)));
+  assert.equal(measured.longestQuestionBytes, Math.max(...Object.values(actual.questions).map(q => Buffer.byteLength(JSON.stringify(q)))));
+  assert.doesNotMatch(JSON.stringify(actual), /DO_NOT_SEND/);
+  assert.equal(isDefinitelyUnsentProviderError(Object.assign(new Error('forged'), { code: 'INVALID_CARDS', requestSent: false })), false);
+});
+
+test('Jev credential timeout is definitely unsent and cannot start a late request, while network failure remains uncertain', async t => {
+  let release, fetches = 0;
+  const credentialStore = { load: () => new Promise(resolve => { release = resolve; }) };
+  const { providers } = await setup(t, { credentialStore, fetchImpl: async () => { fetches++; throw new Error('Synthetic disconnected transport'); } });
+  await assert.rejects(providers.classify('jev', { cards, timeoutMs: 20 }), error => error.code === 'TIMEOUT' && isDefinitelyUnsentProviderError(error));
+  release(fixtureKey);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(fetches, 0);
+  credentialStore.load = async () => fixtureKey;
+  await assert.rejects(providers.classify('jev', { cards }), error => error.code === 'PROVIDER_NETWORK' && !isDefinitelyUnsentProviderError(error));
+  assert.equal(fetches, 1);
 });
 
 test('worker restrictions deny host capabilities without changing global approval or trust settings', () => {

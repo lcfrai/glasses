@@ -8,7 +8,8 @@ import { spawnSync } from 'node:child_process';
 import { createStore, stableId } from '../src/store.mjs';
 import { createIntelligenceStore } from '../src/intelligence-store.mjs';
 import { INTELLIGENCE_SCHEMA } from '../src/intelligence.mjs';
-import { createPublicCatalogue, validatePublicCatalogue, mergePublicCatalogues } from '../src/public-catalogue.mjs';
+import { CLASSIFICATION_POLICY, classificationFingerprint } from '../src/classification-policy.mjs';
+import { createPublicCatalogue, validatePublicCatalogue, mergePublicCatalogues, withPublicCatalogueItems } from '../src/public-catalogue.mjs';
 import { readPublicCatalogueInputs, admitPublicGithubCandidates } from '../scripts/export-public-catalogue.mjs';
 import { startServer } from '../src/server.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -53,6 +54,49 @@ test('official numeric repository redirects and public HTTPS prose survive proje
   const wrong=fixture({row:repo({id:987}),endpoint:'https://api.github.com/repositories/10270250'});assert.equal(createPublicCatalogue(wrong).snapshot.items.length,0);
   const localPath=fixture({row:repo({description:'Local file C:\\Private\\notes.md'})});assert.equal(createPublicCatalogue(localPath).snapshot.items.length,0);
   const casing=fixture({row:repo({html_url:'https://github.com/Public-Lab/Memory'})});casing.capabilities[0].url='https://github.com/public-lab/memory';assert.equal(createPublicCatalogue(casing).snapshot.items.length,1);
+});
+
+test('assessment source matching ignores GitHub owner/repository case but rejects foreign path segments',()=>{
+  for(const [url,endpoint] of [
+    ['https://github.com/Public-Lab/Memory','https://api.github.com/repos/public-lab/memory'],
+    ['https://github.com/public-lab/memory','https://api.github.com/repos/Public-Lab/Memory'],
+  ]) {
+    const input=fixture({row:repo({html_url:url}),endpoint});
+    const {snapshot,report}=createPublicCatalogue(input);
+    assert.ok(snapshot.items[0].assessment);assert.equal(report.assessmentOmitted,0);
+    assert.equal(snapshot.items[0].citations[0].endpoint,endpoint,'Original source spelling is retained');
+  }
+  for(const endpoint of [
+    'https://api.github.com/repos/public-lab/memory-other',
+    'https://api.github.com/repos/public-lab-other/memory',
+    'https://api.github.com/repos/other/memory',
+  ]) {
+    const {snapshot,report}=createPublicCatalogue(fixture({endpoint}));
+    assert.equal(snapshot.items.length,1,'Public metadata body remains available');
+    assert.equal(snapshot.items[0].assessment,null,endpoint);assert.equal(report.assessmentOmitted,1);
+  }
+});
+
+test('case-insensitive assessment sources retain immutable-ref, endpoint and repository-boundary guards',()=>{
+  const revision='a'.repeat(40);
+  for(const [url,accepted] of [
+    [`https://api.github.com/repos/PUBLIC-LAB/Memory/readme?ref=${revision}`,true],
+    ['https://api.github.com/repos/PUBLIC-LAB/Memory/readme?ref=main',false],
+    [`https://api.github.com/repos/PUBLIC-LAB/Memory/readme?ref=${revision}&context=private`,false],
+    [`https://api.github.com/repos/PUBLIC-LAB/Memory-other/readme?ref=${revision}`,false],
+    [`https://api.github.com/repos/PUBLIC-LAB-other/Memory/readme?ref=${revision}`,false],
+    [`https://api.github.com/repos/PUBLIC-LAB/Memory/readme/extra?ref=${revision}`,false],
+    ['https://api.github.com/repos/PUBLIC-LAB/Memory/commits/main',false],
+  ]) {
+    const input=fixture(),item=input.capabilities[0],source=evidence(url,{content:'Public README source'});
+    item.repositoryEvidence=[source];input.evidence.push(source);
+    const refs=url.includes('/readme?')?[source.id,item.metadataEvidence.id]:[item.metadataEvidence.id,source.id];
+    const base={id:item.id,name:item.name,url:item.url,description:item.description,provider:item.provider,sourceKind:item.kind,tags:item.tags};
+    input.assessments[0].sourceFingerprint=sha(JSON.stringify({schema:INTELLIGENCE_SCHEMA,...base,evidenceIds:refs,revision:'branch:main',sourceHash:null}));
+    input.assessments[0].classification.evidenceIds=[source.id];
+    const projected=createPublicCatalogue(input).snapshot.items[0];
+    assert.equal(Boolean(projected.assessment),accepted,url);
+  }
 });
 
 test('locally changed descriptions, labels and stale or unknown-policy assessments never leak into public inference',()=>{
@@ -162,4 +206,104 @@ test('first normal startup preserves an imported Coolify record rather than shad
     app=await startServer({port:0,dataDir:directory,autoScout:false,providers:{status:async()=>({}),classify:async()=>{},plan:async()=>{},rank:async()=>{}}});
     const item=app.store.getCapability(pack.items[0].id);assert.equal(item.origin,'shared');assert.equal(item.github.stars,43210);assert.equal(JSON.stringify(item),before);assert.equal(app.store.search().filter(row=>row.url===item.url).length,1);assert.equal(app.store.getSetting('seedVersion'),1);assert.ok(app.store.search().some(row=>row.origin==='sample'));
   }finally{if(app)await app.close();await rm(directory,{recursive:true,force:true});}
+});
+
+function purposeFixture({generatedAt=later,assessedAt=later,...options}={}){
+  const input=fixture(options),item=input.capabilities[0];
+  input.generatedAt=generatedAt;
+  const assessment=input.assessments[0];assessment.policyVersion=CLASSIFICATION_POLICY;assessment.updatedAt=assessedAt;
+  assessment.classification={artifact:'whole-product',adoption:'install-app',capabilities:['document-editing','office-productivity'],confidence:0.95,evidenceIds:[input.evidence[0].id]};
+  const base={id:item.id,name:item.name,url:item.url,description:item.description,provider:item.provider,sourceKind:item.kind,tags:item.tags};
+  assessment.sourceFingerprint=classificationFingerprint({base,evidenceIds:[input.evidence[0].id],revision:item.provenance.revision,sourceHash:null,policy:CLASSIFICATION_POLICY});
+  return input;
+}
+
+test('purpose-v3 projection accepts new adoption routes only with the policy-bound source fingerprint',()=>{
+  const input=purposeFixture(),{snapshot,report}=createPublicCatalogue(input);
+  assert.equal(report.assessmentOmitted,0);assert.equal(snapshot.items[0].assessment.adoption,'install-app');
+  assert.deepEqual(snapshot.items[0].assessment.capabilities,['document-editing','office-productivity']);
+  assert.equal(snapshot.items[0].assessment.schemaVersion,INTELLIGENCE_SCHEMA);
+  assert.equal(snapshot.items[0].assessment.assessedAt,later);assert.equal(snapshot.items[0].observedAt,time);
+  assert.ok(!JSON.stringify(snapshot).includes('policyVersion'),'Internal cache policy does not change the public wire schema');
+  for(const policy of [undefined,'unknown-policy']){
+    const stale=structuredClone(input);stale.assessments[0].policyVersion=policy;
+    const result=createPublicCatalogue(stale);assert.equal(result.snapshot.items[0].assessment,null);assert.equal(result.report.assessmentOmitted,1);
+  }
+});
+
+test('same-observation reassessment merges only with a newer publication and newer model assessment',()=>{
+  const original=createPublicCatalogue(fixture()).snapshot,updated=createPublicCatalogue(purposeFixture()).snapshot;
+  const result=mergePublicCatalogues(original,updated,{generatedAt:later});
+  assert.deepEqual(result.report,{added:0,updated:1,unchanged:0,conflicts:0});assert.equal(result.snapshot.items[0].assessment.adoption,'install-app');
+  assert.equal(result.snapshot.items[0].observedAt,time);assert.equal(result.snapshot.items[0].github.stars,1234);
+  assert.deepEqual(result.snapshot.items[0].citations,updated.items[0].citations);
+  assert.equal(mergePublicCatalogues(result.snapshot,updated).report.unchanged,1);
+  for(const options of [{generatedAt:time},{assessedAt:time},{assessedAt:'2026-09-28T00:00:00.000Z'}]){
+    const rejected=mergePublicCatalogues(original,createPublicCatalogue(purposeFixture(options)).snapshot);
+    assert.equal(rejected.report.conflicts,1,JSON.stringify(options));assert.deepEqual(rejected.snapshot.items,original.items);
+  }
+});
+
+test('same-observation reassessment cannot smuggle changed or stale source facts through a newer publication',()=>{
+  const original=createPublicCatalogue(fixture()).snapshot;
+  for(const options of [
+    {row:repo({stargazers_count:999999})},{row:repo({description:'A changed purpose without a new metadata observation'})},
+    {row:repo({topics:['deployment']})},{row:repo({license:{spdx_id:'Apache-2.0'}})},
+    {row:repo({fork:true})}, // Same projected fields, different primary metadata bytes.
+    {observedAt:'2026-09-28T00:00:00.000Z'},
+  ]){
+    const next=createPublicCatalogue(purposeFixture(options)).snapshot;
+    const result=mergePublicCatalogues(original,next,{generatedAt:later});
+    assert.equal(result.report.conflicts,1,JSON.stringify(options));assert.deepEqual(result.snapshot.items,original.items);
+  }
+});
+
+test('a later publisher can add or withdraw an assessment while preserving the exact same upstream observation',()=>{
+  const unassessed=fixture();unassessed.assessments=[];
+  const first=createPublicCatalogue(unassessed).snapshot,assessed=createPublicCatalogue(purposeFixture()).snapshot;
+  const addition=mergePublicCatalogues(first,assessed,{generatedAt:later});
+  assert.equal(addition.report.updated,1);assert.ok(addition.snapshot.items[0].assessment);
+  const withdrawalInput=fixture();withdrawalInput.assessments=[];withdrawalInput.generatedAt='2026-10-01T00:00:00.000Z';
+  const withdrawal=createPublicCatalogue(withdrawalInput).snapshot,result=mergePublicCatalogues(assessed,withdrawal);
+  assert.equal(result.report.updated,1);assert.equal(result.snapshot.items[0].assessment,null);
+  assert.equal(result.snapshot.items[0].citations[0].sha256,first.items[0].citations[0].sha256);
+  const rollback=mergePublicCatalogues(result.snapshot,assessed);assert.equal(rollback.report.conflicts,1);
+});
+
+test('database import applies same-observation reassessment idempotently without altering local corrections or work',async()=>{
+  const directory=await mkdtemp(join(tmpdir(),'glasses-reassessment-'));let store,intelligence;
+  try{
+    store=createStore(directory);intelligence=createIntelligenceStore(directory);
+    const original=createPublicCatalogue(fixture()).snapshot,newer=createPublicCatalogue(purposeFixture()).snapshot,id=original.items[0].id;
+    assert.equal((await store.importPublicCatalogue(original)).added,1);
+    store.recordOutcome({capabilityId:id,result:'worked',notes:'PRIVATE outcome remains local'});
+    intelligence.save('corrections',{id,patch:{adoption:'configure-agent',notes:'PRIVATE human correction'},updatedAt:time});
+    const correction=JSON.stringify(intelligence.get('corrections',id)),outcomes=JSON.stringify(store.outcomes(id));
+    assert.equal((await store.importPublicCatalogue(newer)).updated,1);assert.equal(store.getCapability(id).sharedAssessment.adoption,'install-app');
+    assert.equal(store.getCapability(id).sharedPublication.generatedAt,later);assert.equal((await store.importPublicCatalogue(newer)).unchanged,1);
+    assert.equal((await store.importPublicCatalogue(original)).conflicts,1);
+    assert.equal(JSON.stringify(intelligence.get('corrections',id)),correction);assert.equal(JSON.stringify(store.outcomes(id)),outcomes);
+    const local=store.upsertCapability({...store.getCapability(id),origin:'live',name:'PRIVATE curated name',description:'PRIVATE curated description'}).item;
+    const before=JSON.stringify(local),latest=createPublicCatalogue(purposeFixture({generatedAt:'2026-10-02T00:00:00.000Z',assessedAt:'2026-10-02T00:00:00.000Z'})).snapshot;
+    const report=await store.importPublicCatalogue(latest);assert.equal(report.updated,1);assert.equal(report.localOverrides,1);
+    assert.equal(JSON.stringify(store.getCapability(id)),before);assert.equal(JSON.stringify(intelligence.get('corrections',id)),correction);assert.equal(JSON.stringify(store.outcomes(id)),outcomes);
+    const withdrawn=fixture();withdrawn.generatedAt='2026-10-03T00:00:00.000Z';withdrawn.assessments=[];
+    assert.equal((await store.importPublicCatalogue(createPublicCatalogue(withdrawn).snapshot)).updated,1);
+    assert.equal(JSON.stringify(store.getCapability(id)),before);assert.equal(JSON.stringify(intelligence.get('corrections',id)),correction);
+  }finally{intelligence?.close();store?.close();await rm(directory,{recursive:true,force:true});}
+});
+
+
+test('source details refresh without overwriting local metadata or becoming sticky during local refresh',async t=>{
+ const directory=await mkdtemp(join(tmpdir(),'glasses-details-'));const store=createStore(directory);t.after(async()=>{store.close();await rm(directory,{recursive:true,force:true});});
+ const raw=fixture(),base=createPublicCatalogue(raw).snapshot,row=base.items[0];
+ const enriched=features=>withPublicCatalogueItems(base,[{...row,details:{resourceType:'tool',features,citationIds:[row.citations[0].id]}}],{generatedAt:features[0]==='First'?time:later});
+ store.upsertCapability({...raw.capabilities[0],name:'My local title',description:'My private annotation'});
+ await store.importPublicCatalogue(enriched(['First']));let local=store.getCapability(row.id);assert.equal(local.name,'My local title');assert.equal(local.description,'My private annotation');assert.deepEqual(local.details.features,['First']);
+ store.upsertCapability({...local,github:{stars:2000}});await store.importPublicCatalogue(enriched(['Updated source feature']));local=store.getCapability(row.id);assert.equal(local.name,'My local title');assert.deepEqual(local.details.features,['Updated source feature']);assert.match(local.detailsBasis,/Published/);assert.equal(local.github.stars,2000);
+});
+
+test('public collection relationships reject missing parents, cycles, incorrect counts and unavailable citations',()=>{
+ const base=createPublicCatalogue(fixture()).snapshot,row=base.items[0];
+ for(const details of [{parent:{id:'0'.repeat(20),url:'https://example.org/',name:'Missing'},citationIds:[row.citations[0].id]},{parent:{id:row.id,url:row.url,name:row.name},citationIds:[row.citations[0].id]},{memberCount:1,citationIds:[row.citations[0].id]},{features:['Claim'],citationIds:['0'.repeat(20)]},{preview:{imageUrl:'https://127.0.0.1/private.png',sourceUrl:row.url,alt:'Bad',capturedAt:time},citationIds:[row.citations[0].id]}])assert.throws(()=>withPublicCatalogueItems(base,[{...row,details}]));
 });
