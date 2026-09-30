@@ -2,6 +2,7 @@
 // source execution. Call only after the publisher's strict item projection.
 import {createHash} from 'node:crypto';
 import {isIP} from 'node:net';
+import { rawReadmeDeclaration, rawReadmeIdentity, verifyRawReadme } from './github-readme.mjs';
 
 const hash=value=>createHash('sha256').update(value).digest('hex');
 const id=value=>hash(value).slice(0,20);
@@ -77,7 +78,7 @@ function readmeDetails(body){
     if(skip||/^\s{4}|^\s*\||^\s*[-=]{3,}\s*$/.test(raw))continue;
     const value=prose(raw);if(!value)continue;
     if(current){current.lines.push(value);if(current.level===1)paragraphs.push(value);}else paragraphs.push(value);
-    if(current&&/\b(?:features|highlights|capabilities|what.+does)\b/i.test(current.title)&&/^\s*[-*+]\s+/.test(raw))features.push(value);
+    if(current&&/\b(?:features|highlights|capabilities|what.+does)\b/i.test(current.title)&&/^\s*(?:[-*+]|[✔✓✅])\s+/.test(raw))features.push(value.replace(/^[✔✓✅]\s*/,''));
   }
   const introduction=paragraphs.length?paragraphs:sections.find(section=>/^(?:overview|about|introduction|what is|why)\b/i.test(section.title))?.lines||[];
   const overview=bounded(introduction.slice(0,3).join(' '),800,55);
@@ -124,6 +125,11 @@ function declaredResourceType(overview){
   if(typeof overview!=='string')return null;
   const declaration=overview.replace(/^(?:(?:This (?:project|repository)|[A-Za-z][\w./-]{0,50}) (?:is|provides) |This is )/i,'');
   if(/^(?:an? |the )?(?:curated )?(?:collection|library|catalogue) of (?:[A-Za-z-]+ ){0,4}(?:skills|agents|components)\b/i.test(declaration))return 'collection';
+  if(/^(?:an? |the )?(?:(?:curated|awesome|comprehensive|community[ -](?:maintained|driven)) )?(?:list|collection|directory|catalogue|catalog) of\b/i.test(declaration))return 'collection';
+  if(/^(?:an? |the )?(?:specification and documentation|documentation|specification|tutorial|guide|reference)\b/i.test(declaration))return 'reference';
+  // An explicitly enumerated teaching resource differs from notebook software.
+  // Mentioning notebook support or bundling examples never establishes this type.
+  if(/^(?:[\w ()/-]{1,80}: )?\d{1,4} (?:runnable|educational|tutorial) Jupyter notebooks (?:covering|teaching|explaining|demonstrating)\b/i.test(declaration)&&!/^.{0,80}\b(?:platform|runtime|editor|server|application|toolkit|library|framework)\b[^:]*:/i.test(declaration))return 'reference';
   // A README saying "skill" or mentioning SKILL.md does not prove that the
   // package contains an actual skill. Explicit skill-source admission is separate.
   // Monitoring, backup and telemetry daemons also call themselves agents.
@@ -133,12 +139,38 @@ function declaredResourceType(overview){
   return null;
 }
 
+function documentationRepositoryScope(repo,readme,sources){
+  if(!repo||!readme)return null;
+  const source=readme.source,url=new URL(source.url),raw=rawReadmeIdentity(source.url),revision=raw?.revision||url.searchParams.get('ref');
+  if(!/^[a-f\d]{40}$/.test(revision||''))return null;
+  const repository=repo.slice('https://github.com/'.length),endpoint='https://api.github.com/repos/'+repository;
+  const body=raw?source.body:readmeContent(source),path=raw?.path||source.data?.path;
+  if(typeof body!=='string'||typeof path!=='string'||(raw?raw.repository.toLowerCase()!==repository.toLowerCase():url.origin+url.pathname!==endpoint+'/readme'))return null;
+  const gitBlobSha=createHash('sha1').update(Buffer.concat([Buffer.from(`blob ${Buffer.byteLength(body)}\0`),Buffer.from(body)])).digest('hex');
+  const commits=sources.filter(value=>{const u=new URL(value.url);return !u.search&&!u.hash&&u.origin==='https://api.github.com'&&u.pathname.toLowerCase().startsWith(new URL(endpoint).pathname.toLowerCase()+'/commits/')&&u.pathname.split('/').length===6&&value.data?.sha===revision&&/^[a-f\d]{40}$/.test(value.data?.commit?.tree?.sha||'');});
+  for(const commit of commits){
+    const treeSha=commit.data.commit.tree.sha,treeURL=endpoint+'/git/trees/'+treeSha+'?recursive=1';
+    const tree=sources.find(value=>value.url.toLowerCase()===treeURL.toLowerCase()&&value.data?.sha===treeSha&&value.data?.truncated===false&&Array.isArray(value.data?.tree));if(!tree)continue;
+    const entries=tree.data.tree,paths=new Set(entries.map(entry=>entry?.path));
+    if(paths.size!==entries.length||entries.some(entry=>typeof entry?.path!=='string'||entry.path.split('/').some(part=>!part||part==='.'||part==='..')||entry.path.includes('\\')))continue;
+    const blobs=entries.filter(entry=>entry.type==='blob'),matches=(name,sha)=>blobs.some(entry=>entry.path===name&&(!sha||entry.sha===sha));
+    if(!matches(path,gitBlobSha)||!['mkdocs.yml','mkdocs.yaml'].some(name=>matches(name))||!matches('docs/index.md'))continue;
+    // Require an overwhelmingly documentation tree, and no normal SDK/runtime
+    // implementation root. A '-docs' suffix or an SDK marketing README is not proof.
+    const docs=blobs.filter(entry=>entry.path.startsWith('docs/'));
+    if(docs.length<20||docs.length/blobs.length<0.8||entries.some(entry=>/^(?:src|lib|libs|packages|pkg|internal|sdk)(?:\/|$)/i.test(entry.path)))continue;
+    return {commit,tree};
+  }
+  return null;
+}
+
 /** Return a fresh public item array; all relationship targets must already exist. */
 export function enrichCatalogueDetails({items,evidence}){
   if(!Array.isArray(items)||!Array.isArray(evidence))throw new Error('Public items and retained evidence arrays are required');
   const rows=items.map(item=>Object.fromEntries(PUBLIC_KEYS.filter(key=>Object.hasOwn(item,key)).map(key=>[key,structuredClone(item[key])])));
   const targets=new Map(rows.filter(row=>row.id===id(row.url)&&publicURL(row.url)).map(row=>[repoKey(row.url)||row.url.toLowerCase(),row]));
   const sources=evidence.map(verified).filter(Boolean).sort((a,b)=>b.observedAt.localeCompare(a.observedAt)||a.sha256.localeCompare(b.sha256));
+  const scopeSources=sources.filter(source=>/^https:\/\/api\.github\.com\/repos\/[^/]+\/[^/]+\/(?:commits\/[^/?]+|git\/trees\/[a-f\d]{40}\?recursive=1)$/i.test(source.url));
   const byURL=new Map();for(const source of sources)if(!byURL.has(source.url))byURL.set(source.url,source);
   const directories=sources.filter(source=>source.url==='https://registry.directory/directory.json'&&Array.isArray(source.data?.registries));
   const collections=[],seenCollections=new Set();
@@ -160,7 +192,19 @@ export function enrichCatalogueDetails({items,evidence}){
   const readmes=new Map();for(const source of sources){
     const url=new URL(source.url),match=url.pathname.match(/^\/repos\/([^/]+)\/([^/]+)\/readme$/i);
     if(url.hostname!=='api.github.com'||!match||[...url.searchParams.keys()].some(key=>key!=='ref')||!/^\w{40}$/.test(url.searchParams.get('ref')||'')||!/^[a-f\d]{40}$/i.test(url.searchParams.get('ref')))continue;
-    const key=`https://github.com/${match[1]}/${match[2]}`.toLowerCase();if(!readmes.has(key)){const body=readmeContent(source);if(body!==null)readmes.set(key,{source,body});}
+    const key=`https://github.com/${match[1]}/${match[2]}`.toLowerCase();if(!readmes.has(key)){
+      const body=readmeContent(source);if(body!==null)readmes.set(key,{source,body});
+      else if(source.data?.encoding==='none'){
+        try{
+          const identity={repository:match[1]+'/'+match[2],revision:url.searchParams.get('ref')},declared=rawReadmeDeclaration({...source,status:200},identity),raw=byURL.get(declared.url);
+          verifyRawReadme(raw&&{...raw,status:200},{...source,status:200},identity);
+          // Full bytes/hash/blob are verified before a bounded prose-only parse.
+          // Keep complete lines and the existing 180-word published output cap.
+          const prefix=Buffer.from(raw.body).subarray(0,256000).toString('utf8'),boundedPrefix=Buffer.byteLength(raw.body)>256000?prefix.slice(0,prefix.lastIndexOf('\n')+1):prefix;
+          readmes.set(key,{source:raw,body:boundedPrefix});
+        }catch{/* Retain metadata-only details when source proof is incomplete. */}
+      }
+    }
   }
   const linkProofs=new Map();
   const add=(row,details,source,kind)=>{
@@ -171,6 +215,7 @@ export function enrichCatalogueDetails({items,evidence}){
   };
   for(const row of rows){
     const details={resourceType:row.kind==='component'?'component':row.kind==='solution'?'tool':'reference',citationIds:row.citations[0]?[row.citations[0].id]:[]},ownSource=sources.find(source=>source.url===row.url&&source.data&&Array.isArray(source.data.files)),indexedItem=indexed.get(row.url);
+    const declared=declaredResourceType(row.description);if(declared)details.resourceType=declared;
     let collection=null;
     if(indexedItem){
       if(add(row,details,indexedItem.source,'registry-item-index'))Object.assign(details,directMetadata(indexedItem.row));
@@ -196,6 +241,8 @@ export function enrichCatalogueDetails({items,evidence}){
     if(parentCollection&&add(row,details,parentCollection.document,'registry-directory'))Object.assign(details,directMetadata(parentCollection.row),{resourceType:'collection'});
     const readme=readmes.get(repoKey(row.url));
     if(readme){const extracted=readmeDetails(readme.body);if(Object.keys(extracted).length&&add(row,details,readme.source,'github-source-evidence')){Object.assign(details,extracted);const declared=declaredResourceType(extracted.overview);if(declared)details.resourceType=declared;}}
+    const documentationScope=documentationRepositoryScope(repoURL(row.url),readme,scopeSources);
+    if(documentationScope&&add(row,details,documentationScope.commit,'github-source-evidence')&&add(row,details,documentationScope.tree,'github-source-evidence'))details.resourceType='reference';
     if(details.citationIds?.length&&Object.keys(details).some(key=>key!=='citationIds'))row.details=details;
   }
   for(const row of rows){const proofs=linkProofs.get(row.id);if(!proofs?.length)continue;const details=row.details||{};for(const proof of proofs)add(row,details,proof.source,proof.kind);details.memberCount=proofs.length;details.resourceType='collection';row.details=details;}

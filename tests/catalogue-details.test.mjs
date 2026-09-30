@@ -169,7 +169,7 @@ test('direct source declarations can identify agents but mentioning SKILL.md alo
     ['# Tool\nA self-hosted LLM agent for answering research questions.','agent'],
     ['# Tool\nAn AI agent framework for connecting tools.','tool'],
     ['# Tool\nA memory database for coding agents.','tool'],
-    ['# Tool\nA tutorial explaining how to write SKILL.md and build an agent.','tool'],
+    ['# Tool\nA tutorial explaining how to write SKILL.md and build an agent.','reference'],
     ['# Tool\nA curated collection of agent skills.\nEach has a SKILL.md.','collection'],
   ]){
     const details=enrichCatalogueDetails({items:[row],evidence:[readme('public-lab/tool',body)]})[0].details;
@@ -184,4 +184,44 @@ test('keywords come from declared metadata fields only and stay bounded without 
   const row=enrichCatalogueDetails({items:data.items,evidence:[data.directory,data.index,data.registry,data.docs]})[1];
   assert.deepEqual(row.details.keywords.slice(0,5),['faq','disclosure','accordion','keyboard','aria-expanded']);assert.equal(row.details.keywords.length,20);
   assert.ok(!JSON.stringify(row.details).includes('PRIVATE_CODE_KEYWORD'));
+});
+
+test('explicit community lists and enumerated teaching notebooks are typed without relabelling notebook applications',()=>{
+  const metadata=source('https://api.github.com/repos/public-lab/resource',{private:false}),row=item('https://github.com/public-lab/resource','Resource',metadata);
+  for(const [description,body,expected] of [
+    ['Database resources','# Resources\n> Community driven list of database tools\n','collection'],
+    ['Community-maintained directory of software.','# Resources\nA useful set of links.','collection'],
+    ['Agent memory for LLMs: 30 runnable Jupyter notebooks covering conversation buffers and production patterns.','# Resources\nLearn every agent memory technique.','reference'],
+    ['A notebook server with 30 runnable Jupyter notebooks covering examples.','# Tool\nA notebook server for teams.','tool'],
+    ['A platform: 30 runnable Jupyter notebooks covering examples.','# Tool\nA collaborative computing platform.','tool'],
+    ['A framework for executing Jupyter notebooks.','# Tool\nIncludes educational notebooks and tutorials.','tool']
+  ])assert.equal(enrichCatalogueDetails({items:[{...row,description}],evidence:[readme('public-lab/resource',body)]})[0].details.resourceType,expected,description);
+});
+
+function docsScopeFixture(){
+  const repo='public-lab/manual',treeSha='b'.repeat(40),body='# SDK\nA flexible framework for building applications.\n',metadata=source('https://api.github.com/repos/'+repo,{private:false}),row=item('https://github.com/'+repo,'SDK',metadata);
+  const readmeSource=readme(repo,body),blob=createHash('sha1').update(Buffer.concat([Buffer.from(`blob ${Buffer.byteLength(body)}\0`),Buffer.from(body)])).digest('hex');
+  const commit=source(`https://api.github.com/repos/${repo}/commits/main`,{sha:revision,commit:{tree:{sha:treeSha}}});
+  const entries=[{path:'README.md',type:'blob',sha:blob},{path:'mkdocs.yml',type:'blob',sha:'c'.repeat(40)},{path:'docs/index.md',type:'blob',sha:'d'.repeat(40)},...Array.from({length:22},(_,i)=>({path:`docs/guide-${i}.md`,type:'blob',sha:'e'.repeat(40)}))];
+  const tree=source(`https://api.github.com/repos/${repo}/git/trees/${treeSha}?recursive=1`,{sha:treeSha,truncated:false,tree:entries});
+  return {row,readmeSource,commit,tree};
+}
+test('documentation scope requires exact README blob, pinned commit/tree linkage and overwhelming docs without implementation root',()=>{
+  const input=docsScopeFixture(),output=enrichCatalogueDetails({items:[input.row],evidence:[input.readmeSource,input.commit,input.tree]})[0];
+  assert.equal(output.details.resourceType,'reference');assert.ok(output.citations.some(ref=>ref.sha256===input.tree.sha256));
+  assert.equal(input.row.details,undefined,'pure enrichment cannot mutate original source records');
+  for(const mutate of [
+    data=>{data.commit=source(data.commit.url,{...JSON.parse(data.commit.body),sha:'f'.repeat(40)});},
+    data=>{data.tree=source(data.tree.url.replace('public-lab/manual','other/manual'),JSON.parse(data.tree.body));},
+    data=>{data.tree=source(data.tree.url,{...JSON.parse(data.tree.body),truncated:true});},
+    data=>{const body=JSON.parse(data.tree.body);body.tree[0].sha='0'.repeat(40);data.tree=source(data.tree.url,body);},
+    data=>{const body=JSON.parse(data.tree.body);body.tree.push({path:'src/runtime.ts',type:'blob',sha:'c'.repeat(40)});data.tree=source(data.tree.url,body);},
+    data=>{const body=JSON.parse(data.tree.body);body.tree=body.tree.filter(entry=>entry.path!=='mkdocs.yml');data.tree=source(data.tree.url,body);},
+    data=>{const body=JSON.parse(data.tree.body);body.tree=body.tree.filter(entry=>entry.path!=='docs/index.md');data.tree=source(data.tree.url,body);},
+    data=>{const body=JSON.parse(data.tree.body);body.tree.push(...Array.from({length:40},(_,i)=>({path:`examples/app-${i}.ts`,type:'blob',sha:'f'.repeat(40)})));data.tree=source(data.tree.url,body);},
+    data=>{data.tree={...data.tree,sha256:'0'.repeat(64)};},
+    data=>{data.tree=source(data.tree.url,{...JSON.parse(data.tree.body),sha:'f'.repeat(40)});}
+  ]){const broken=docsScopeFixture();mutate(broken);assert.equal(enrichCatalogueDetails({items:[broken.row],evidence:[broken.readmeSource,broken.commit,broken.tree]})[0].details.resourceType,'tool');}
+  const noProof={...input.row,url:'https://github.com/public-lab/example-docs'};noProof.id=id(noProof.url);
+  assert.equal(enrichCatalogueDetails({items:[noProof],evidence:[]})[0].details.resourceType,'tool','name-only docs inference is forbidden');
 });

@@ -4,13 +4,17 @@ Find existing software before rebuilding it. Glasses gives coding agents a searc
 
 [Browse the public catalogue](https://lcfr.ai/glasses). The catalogue is a versioned public snapshot; research and private project work run on your own machine.
 
+Release **0.3.2** adds resumable bulk discovery across tools, components, skills, agents, collections and references. It also makes the release's **59 static source previews** visible through card thumbnails, a **Has preview** filter and direct links to individual catalogue entries. These captures show documented examples; they are not executable demos or proof that a component fits your project.
+
 ## Run locally
 
 Requires Node.js 24 or later and npm. The local interface binds to `127.0.0.1:4317`.
 
-This README describes source release **0.3.1**. The setup command requires this version's `scripts/setup.mjs`; a public checkout still on 0.3.0 needs the manual commands below. There is no published `npx` installer.
+This README describes source release **0.3.2**. The setup command requires this version's `scripts/setup.mjs`; a public checkout still on 0.3.0 needs the manual commands below. There is no published `npx` installer.
 
-**Upgrading from 0.3.0:** update the client before importing a new snapshot with expanded adoption routes. The older validator does not recognize values such as `install-app`, `run-cli` and `use-hosted` and will reject those snapshots. Keep your existing `.glasses` data directory when replacing source files, then run `npm ci` and `npm run build`. Local notes, workspaces and human corrections remain separate from shared metadata.
+**Upgrading from 0.3.0 or 0.3.1:** update the client before importing the new snapshot. Version 0.3.0 does not recognize expanded adoption routes such as `install-app`, `run-cli` and `use-hosted`; version 0.3.1 does not support the new public-page evidence. Keep your existing `.glasses` data directory when replacing source files, then run `npm ci` and `npm run build`. Local notes, workspaces and human corrections remain separate from shared metadata.
+
+Version 0.3.2 also binds registry evidence to the exact provider and item URL, fixing collisions between identically named components. Existing local registry assessments are marked stale until explicitly reclassified; the update itself does not make model calls. Whole-tool classification caches are unchanged by this registry-specific correction. Shared assessments remain attributed snapshot observations, separate from your local cache.
 
 ```sh
 git clone https://github.com/lcfrai/glasses.git
@@ -19,7 +23,7 @@ node scripts/setup.mjs
 npm start
 ```
 
-For the downloaded 0.3.1 source package, extract it and run the final two commands in its folder. Setup installs this repository's locked dependencies if they are missing, builds the local interface and asks **“Fetch latest catalogue now? [y/N]”**. Yes fetches `https://lcfr.ai/glasses/catalogue.json`; No saves your choice and leaves Glasses usable. A noninteractive terminal without an explicit flag leaves the choice pending and makes no catalogue request. Setup does not start a server or register an agent automatically.
+For the downloaded 0.3.2 source package, extract it and run the final two commands in its folder. Setup installs this repository's locked dependencies if they are missing, builds the local interface and asks **“Fetch latest catalogue now? [y/N]”**. Yes fetches `https://lcfr.ai/glasses/catalogue.json`; No saves your choice and leaves Glasses usable. A noninteractive terminal without an explicit flag leaves the choice pending and makes no catalogue request. Setup does not start a server or register an agent automatically.
 
 Open <http://127.0.0.1:4317>. If setup has not recorded a choice, the local app offers the same Yes/No choice. No shared catalogue is fetched until you approve it. Use **Shared catalogue** in the app to import later or retry, or run:
 
@@ -32,7 +36,7 @@ Each fetch command is an explicit one-time import; consent does not enable autom
 
 For scripted setup, `node scripts/setup.mjs --catalogue=import` or `--catalogue=decline` records an explicit choice. `--data-dir DIRECTORY` uses an isolated data directory. To use that same custom directory when starting the server, set `GLASSES_DATA_DIR`; without it the app uses `.glasses` beside this checkout.
 
-Manual build/start works with both 0.3.0 and 0.3.1:
+Manual build/start works with both 0.3.0 and 0.3.2:
 
 ```sh
 npm ci
@@ -58,13 +62,37 @@ Suggested instruction:
 
 Tools cover compact search, source inspection, public import and research, adoption briefs, evidence, classification and ranking, outcomes, and shared workspace editing/export. The calling agent decides what to adopt. No result means catalogue coverage is incomplete.
 
-Search accepts a `resourceType` such as `tool`, `component`, `skill` or `agent`. Inspect a collection and pass its `parentId` to search its individual members. Cards expose source-backed features, use cases, keywords and dependencies where documented. Selected visual entries have dated source-demo captures; uncaptured entries link to upstream documentation.
+Search accepts `resourceType: "tool"`, `"component"`, `"skill"`, `"agent"`, `"collection"` or `"reference"`, and `hasPreview: true` selects entries with recorded previews. Inspect a collection and pass its `parentId` to search its individual members. Cards expose source-backed features, use cases, keywords and dependencies where documented. References identify useful documentation or public pages; they are not presented as installed software.
+
+In the public catalogue, use **Browse 59 source previews** or **Has preview**, then open a card to see its dated capture and original documentation link. **Copy catalogue link** creates a `/glasses?item=ID` link that reopens the same entry; browser back and forward follow those selections. Uncaptured entries retain an explicit source-link fallback. Preview availability is partial, and the preview filter uses free catalogue browsing rather than a paid ranking request.
 
 Skills and agent profiles have pinned source links and reviewed download bundles with original files, hashes and licence notices. The local `glasses_inspect` can retrieve a pinned guidance document and verify its published hash. These files remain untrusted source data: Glasses never installs or activates their instructions automatically, and distribution does not establish compatibility with your agent.
 
 ## Research and model connections
 
 Add a source from the catalogue, or create and amend a research plan in Research. GitHub discovery prioritizes popular results within a relevant query, with paging and archived/fork exclusions by default. Stars indicate popularity, not security, compatibility or suitability.
+
+### Bulk discovery
+
+Open **Research → Bulk discovery**, choose resource lanes and a candidate limit, and select **Start bulk scan**. The browser continues bounded batches of at most 100 scheduling steps while that Research view stays open. Leaving it or closing the browser stops continuation after the current server batch. Cancellation, source errors, rate limits and configured caps stop further batches; inspect the source receipts before an explicit **Resume scan**. Saved plans and cursors survive a restart. **Refresh existing sources** revisits known records for updated source evidence and descriptions.
+
+The default lanes favor whole tools while also acquiring individual components, verified guidance files, collections and public references. A requested lane is not an admission guarantee: missing source or licence evidence stays visible as a review outcome. Bulk discovery does not run models, install code, activate instructions or publish your local catalogue. **Classify new results on this page** is a separate action governed by your saved limits.
+
+With the local server running, the CLI offers the same saved plans and receipts:
+
+```sh
+npm run catalogue:bulk -- --status
+npm run catalogue:bulk -- --run --wait --batches=3 --max-steps=100
+npm run catalogue:bulk -- --resume=PLAN_ID --wait --batches=3 --max-steps=100
+npm run catalogue:bulk -- --status=PLAN_ID
+npm run catalogue:bulk -- --cancel=PLAN_ID
+```
+
+`--run` creates a new default plan; `--resume` continues a saved one. `--batches=3` permits at most three batches and stops at rate limits or configured caps. A CLI wait timeout does not cancel work already running. For a custom JSON plan, use `node scripts/bulk-scan.mjs --run --plan=bulk-plan.json --wait`; see [Bulk discovery](docs/BULK_DISCOVERY.md) for source adapters, caps and recovery.
+
+An agent can call local `glasses_bulk_scan` with `action: "create"`, then `action: "run"` and the returned `id`. Runs are asynchronous: poll `action: "status"` to inspect durable progress before requesting another batch. `action: "cancel"` preserves the checkpoint. This local tool is distinct from the shared read-only hosted MCP, which does not run discovery in your workspace.
+
+### Optional model processing
 
 Public connector fetches and catalogue import require no LLM calls. Optional classification and ranking use TypeSafe Jev with your own API key, entered in Connections, or a restricted installed Codex worker. Jev uses its own API billing; Codex uses the signed-in client's allowance. Inspect the saved limits and enable automatic work deliberately. Usage and partial failures remain visible. Classification is imperfect and may need review.
 

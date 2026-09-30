@@ -1,7 +1,7 @@
 {
-  "version": "0.3.1",
-  "createdAt": "2026-09-30T04:09:20.530Z",
-  "catalogueContentHash": "980962476b06190a7d207a100aa641705a3cc96bedbad01faf798f349f4a7eb0",
+  "version": "0.3.2",
+  "createdAt": "2026-09-30T06:21:05.801Z",
+  "catalogueContentHash": "d188f3a6cf61e2708a207d5c1ba0d2d1eb311dbc2cbded415cddaed695d9a964",
   "policy": "Allowlisted source, synthetic tests and public metadata only. No original Git history, credentials, local databases, workspaces, private notes or fetched source bodies.",
   "files": [
     {
@@ -21,13 +21,18 @@
     },
     {
       "path": "catalogue/catalogue.json",
-      "bytes": 14976475,
-      "sha256": "9e8200e2dfa84956875f2c94a10846ab78b2df1a76b58563b48e6bf4f96f3727"
+      "bytes": 19689732,
+      "sha256": "d41750aae052e0eff17679c294c520f487a6437ae48cf4a5ee3246118a43a3b5"
     },
     {
       "path": "CONTRIBUTING.md",
       "bytes": 953,
       "sha256": "02c5366611887eb91b41af82c054c04a13cdb70a656044de5bd3aca2b4f0f01e"
+    },
+    {
+      "path": "docs/BULK_DISCOVERY.md",
+      "bytes": 9728,
+      "sha256": "8d22140b39042c37ca4d1a5d374453bf282e499d0bb5916f98f34d842a2d3aa6"
     },
     {
       "path": "docs/CATALOGUE_REFRESH.md",
@@ -47,12 +52,12 @@
     {
       "path": "package-lock.json",
       "bytes": 175068,
-      "sha256": "3e0a606880ce977f52d2ba46885ebebad884ffdfed6e8a09736429fe746a9398"
+      "sha256": "59e78d3b0974c3f61aab83eaf471e558a0e13d5fad177ef976ee2436ee270f3a"
     },
     {
       "path": "package.json",
-      "bytes": 1701,
-      "sha256": "95a4497e65ef2fcfaf2dca09ecd576a3d3ebac1b10e1cb3f6da725378f7d3d30"
+      "bytes": 1753,
+      "sha256": "e649df9c31ea5fc3f960ae82172b9e5a5977fa895c84e27db84f67ef717ce9f4"
     },
     {
       "path": "public/api-client.mjs",
@@ -61,8 +66,13 @@
     },
     {
       "path": "public/app.jsx",
-      "bytes": 87087,
-      "sha256": "cab373b6e355d483e447fcddf12ee20aa49d08889ad97b6bdc4ccbd79df91cbb"
+      "bytes": 88169,
+      "sha256": "e6aca872c6a389be0c9ae3ad71399da03cdfd26628359663c7aa0935e8bf55b8"
+    },
+    {
+      "path": "public/BulkDiscovery.jsx",
+      "bytes": 10903,
+      "sha256": "e859d3de3a1482843de02f24fca3ecc2c7c24c4a33ffecf14ca0fe92ba20738f"
     },
     {
       "path": "public/CatalogueRefresh.jsx",
@@ -81,8 +91,8 @@
     },
     {
       "path": "public/intelligence.jsx",
-      "bytes": 26378,
-      "sha256": "e2ae5faa9d3f0223fd11fa2fea2ad53981107d924f4e913d875ca57865b2f789"
+      "bytes": 26514,
+      "sha256": "f9560323b9aa8c72ef5bb2012e340ca9c442e1422650a9b67a01cab42293383b"
     },
     {
       "path": "public/onboarding.jsx",
@@ -101,13 +111,18 @@
     },
     {
       "path": "README.md",
-      "bytes": 9325,
-      "sha256": "ee26c5ad02e89ef0cb585890466493b4208112719f57512a7026fb30dc0dd5a3"
+      "bytes": 12986,
+      "sha256": "919c684207f22410dd5f6533079583c9486ddb3891f25a0a7bee1d3974dddc5c"
     },
     {
       "path": "scripts/build.mjs",
       "bytes": 566,
       "sha256": "6676e3b2c99cd40e6f80f3e169705ee41e49909d1c4bc74c82a4ae364bfe6a5a"
+    },
+    {
+      "path": "scripts/bulk-scan.mjs",
+      "bytes": 6001,
+      "sha256": "d0666531a00ece58399beed4bf9737e26d744888793c9b057d9a18ce3ba6e199"
     },
     {
       "path": "scripts/catalogue-setup.mjs",
@@ -155,14 +170,29 @@
       "sha256": "1e5a045c7f8a370d8e70d2a54df68f6a4c3345774e80a526697e3965a9b105ea"
     },
     {
+      "path": "src/bulk-discovery.mjs",
+      "bytes": 17639,
+      "sha256": "4551e5061168794afa5d039afafcae1e9f0523651fd53a18d04093ac44894acd"
+    },
+    {
+      "path": "src/bulk-import.mjs",
+      "bytes": 6799,
+      "sha256": "6210332417fb60d8e107726a1fffb8637faa752dae9f84a7d9663bbda8b2f0d7"
+    },
+    {
+      "path": "src/bulk-sources.mjs",
+      "bytes": 12362,
+      "sha256": "b1029e53ef56f49649c942544e907ce78ab7a41c20d55e50a4772e5fcdaea0f6"
+    },
+    {
       "path": "src/canvas-bridge.mjs",
       "bytes": 2612,
       "sha256": "6d7fe890c43923ef45f32d01c98056135757a32d8929479b66f3daaa553313b4"
     },
     {
       "path": "src/catalogue-details.mjs",
-      "bytes": 18015,
-      "sha256": "072e725c80558386985ba036b22dbee460062145a890e10765ff654f00c10063"
+      "bytes": 22813,
+      "sha256": "de82833fae60c04a60e496ddbf28f001551cf2f9b4c6fc2ec60991406840751f"
     },
     {
       "path": "src/catalogue-refresh.mjs",
@@ -171,8 +201,8 @@
     },
     {
       "path": "src/classification-policy.mjs",
-      "bytes": 1048,
-      "sha256": "0e50c520e524c38767b829d29daadc9d8317b1989def2458eb24301038b4fa0c"
+      "bytes": 2224,
+      "sha256": "4884dd24838eff1edf5343fd890921db104e168c9a0c5b336e71426568a4f4ba"
     },
     {
       "path": "src/credential-store.mjs",
@@ -186,13 +216,18 @@
     },
     {
       "path": "src/discovery.mjs",
-      "bytes": 44035,
-      "sha256": "5b91f538e6223bdc46d95364a325ec63f97bdc1814cd95e4685fbaffbbcaff4c"
+      "bytes": 44803,
+      "sha256": "10016a30613b0f08162f5250bf5e01c897e0b78afeedea3300856ad9ab6189e8"
     },
     {
       "path": "src/github-kind.mjs",
       "bytes": 1255,
       "sha256": "b4b5bd4ea5fe77280b402f6093fad8f33561dba0dd42356258bd9b57d67dc208"
+    },
+    {
+      "path": "src/github-readme.mjs",
+      "bytes": 3167,
+      "sha256": "f9901f6b6e8c7c6e9d454361781c32725779e4d66db2913996854fcb4446ed1e"
     },
     {
       "path": "src/intelligence-store.mjs",
@@ -201,18 +236,23 @@
     },
     {
       "path": "src/intelligence.mjs",
-      "bytes": 34778,
-      "sha256": "65db1c31e1588ddef31d1b9b22d70028361efa15237a5fcbc6757150ddc4afc6"
+      "bytes": 35360,
+      "sha256": "80b5d7f880e5917e372417e625521a944ee4638bee659b373d9bbbbe5cd07c6f"
     },
     {
       "path": "src/mcp.mjs",
-      "bytes": 21766,
-      "sha256": "d5f62c597314f0e00cf0e5bf8c4c861b902868509870d475933d1402d1701914"
+      "bytes": 24472,
+      "sha256": "fe2df11c839210de44e0e1af660e3cd72e4bd651370b9e1efd406ef0c3bf75a9"
     },
     {
       "path": "src/onboarding.mjs",
       "bytes": 7601,
       "sha256": "86fc5fc6699a3002aa2aa9eee380a4af1af4f11bc82456deda3fd08316b8e50e"
+    },
+    {
+      "path": "src/page-metadata.mjs",
+      "bytes": 1321,
+      "sha256": "1bb55300805c5f756cb7e93657d9247481ee68b9d75fb730da95020cedc725f8"
     },
     {
       "path": "src/preview-worker.mjs",
@@ -236,8 +276,13 @@
     },
     {
       "path": "src/public-catalogue.mjs",
-      "bytes": 22684,
-      "sha256": "3d0b409e44fa676b78e98890724aa010d048195f8f60c01412e91627e2baf3a0"
+      "bytes": 26641,
+      "sha256": "22bf6f2bb247afa31fc7cecfa653ea263db0d49600ae9b36bcf0e42a89911416"
+    },
+    {
+      "path": "src/public-source-fetcher.mjs",
+      "bytes": 3945,
+      "sha256": "ce9962d3e57c7318625dc6d2835d74bf35bd101fcd54d7a6622599dd7d9ccfb2"
     },
     {
       "path": "src/research.mjs",
@@ -251,8 +296,8 @@
     },
     {
       "path": "src/server.mjs",
-      "bytes": 23548,
-      "sha256": "2cee7a444c223d9c4f871413ae87e556cbfeeef4b7ed2c950f0bfda383f0d8b5"
+      "bytes": 26392,
+      "sha256": "ee6961290e77ee74c70e036754e9a5279d7be2b3683e2f777e5f42040e3ae873"
     },
     {
       "path": "src/store.mjs",
@@ -285,14 +330,29 @@
       "sha256": "0d8ebb6f01174d373f79cc2385bd671aae25cda84cec3295f7d4e34b59269ca1"
     },
     {
+      "path": "tests/bulk-api.test.mjs",
+      "bytes": 6655,
+      "sha256": "82397d9419d2af0f154ec7e01ebb9a9c025d9ca10259526cdeb96c3daf1392be"
+    },
+    {
+      "path": "tests/bulk-discovery.test.mjs",
+      "bytes": 30697,
+      "sha256": "4f158253e76206b9dff99eec0798f772dd5a0f817e4c3d4e3f6952f60443cee7"
+    },
+    {
+      "path": "tests/bulk-projection.test.mjs",
+      "bytes": 8068,
+      "sha256": "4a2ee8b00795c179aec82b7191963a6eaa31488bef687ef16ff396a8679a7864"
+    },
+    {
       "path": "tests/canvas-e2e.mjs",
       "bytes": 17754,
       "sha256": "84c97a44d09142d353de1d35a54c7262d35d29a12fb050b390baed9dec6007ae"
     },
     {
       "path": "tests/catalogue-details.test.mjs",
-      "bytes": 19079,
-      "sha256": "ae833d2c8e251da4f83b8d909e0c92492f579eaecac5eb6b91e31c55ffb67de8"
+      "bytes": 23581,
+      "sha256": "019d43dccf8016f297ec88807f096dbea6a129e4b12a7fe932da8574d50039d5"
     },
     {
       "path": "tests/catalogue-e2e.mjs",
@@ -338,6 +398,11 @@
       "path": "tests/discovery-github-routing.test.mjs",
       "bytes": 10372,
       "sha256": "9c5bc4b6ce803ca421a26f1c604c66390dec60cfc1be30388599dfeeeae0238e"
+    },
+    {
+      "path": "tests/discovery-large-readme.test.mjs",
+      "bytes": 10780,
+      "sha256": "35e6c4f4b51f39e640d19cbc9c9ca02794c6ece8272c5c5e9ce331ad6c0c59ff"
     },
     {
       "path": "tests/discovery-priority.test.mjs",
@@ -423,6 +488,11 @@
       "path": "tests/public-catalogue.test.mjs",
       "bytes": 36045,
       "sha256": "825513dad8df322a6c1d89a318295bb10186a9ede348ace8f226465d1be85ca9"
+    },
+    {
+      "path": "tests/registry-classification.test.mjs",
+      "bytes": 8515,
+      "sha256": "c7c42328992018d43638a31a6d3ebfb14b4633420a95ccd1bc42553139f6ba5a"
     },
     {
       "path": "tests/research.test.mjs",

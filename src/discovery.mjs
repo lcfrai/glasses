@@ -5,6 +5,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { licenseInfo, stableId, searchTerms } from './store.mjs';
 import { githubRepositoryKind } from './github-kind.mjs';
+import { MAX_RAW_README_BYTES, rawReadmeDeclaration, verifyRawReadme } from './github-readme.mjs';
 
 const stamp = () => new Date().toISOString();
 const small = (s,n=4000) => typeof s==='string'?s.slice(0,n):'';
@@ -231,9 +232,9 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
   let scouting=false;
   const requestContext=new AsyncLocalStorage();
   const idleWaiters=new Set();
-  const read=async(url)=>{
+  const read=async(url,options={})=>{
     const signal=requestContext.getStore();signal?.throwIfAborted();validatePublicURL(url);
-    let doc;try{doc=await fetcher(url,{signal});}catch(error){if(error&&typeof error==='object')error.sourceUrl=url;throw error;}
+    let doc;try{doc=await fetcher(url,{...options,signal});}catch(error){if(error&&typeof error==='object')error.sourceUrl=url;throw error;}
     signal?.throwIfAborted();return {...doc,evidence:store.retainEvidence({...doc,url:doc.url||url})};
   };
   const failureState=error=>{
@@ -265,13 +266,22 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
     const endpoint=`https://api.github.com/repos/${parts.map(encodeURIComponent).join('/')}`;
     const commitDoc=await read(`${endpoint}/commits/${encodeURIComponent(item.github?.defaultBranch||'HEAD')}`),commit=asJSON(commitDoc);
     if(!/^[a-f0-9]{40}$/.test(commit.sha||''))throw new Error('GitHub commit schema missing exact revision');
-    const files=[],evidence=[],errors=[];let licence=item.licenseEvidence;
+    const files=[],evidence=[],errors=[];let licence=item.licenseEvidence,repositoryReadmeProof=null;
     for(const resource of ['license','readme']) {
       const url=`${endpoint}/${resource}?ref=${commit.sha}`;
       try {
         const doc=await read(url),data=asJSON(doc);
-        if(data.encoding!=='base64'||typeof data.content!=='string')throw new Error('Unsupported repository content encoding');
-        const content=Buffer.from(data.content,'base64').toString('utf8');files.push({path:data.path||resource.toUpperCase(),content});evidence.push(doc.evidence);
+        let content;
+        if(resource==='readme'&&data.encoding==='none'){
+          const identity={repository:parts.join('/'),revision:commit.sha},declared=rawReadmeDeclaration(doc,identity);
+          const raw=await read(declared.url,{maxBytes:MAX_RAW_README_BYTES,redirects:0});verifyRawReadme(raw,doc,identity);
+          content=raw.body;evidence.push(doc.evidence,raw.evidence);
+          repositoryReadmeProof={apiEvidence:doc.evidence,rawEvidence:raw.evidence,revision:commit.sha,path:declared.path,bytes:declared.bytes,gitBlobSha:declared.gitBlobSha};
+        }else{
+          if(data.encoding!=='base64'||typeof data.content!=='string')throw new Error('Unsupported repository content encoding');
+          content=Buffer.from(data.content,'base64').toString('utf8');evidence.push(doc.evidence);
+        }
+        files.push({path:data.path||resource.toUpperCase(),content});
         if(resource==='license')licence={status:'fetched',scope:'repository',sourceUrl:url,revision:commit.sha,spdx:data.license?.spdx_id||null,path:data.path,sha256:createHash('sha256').update(content).digest('hex'),evidenceId:doc.evidence.id,note:'Exact repository licence text retained. This is licence evidence, not legal or security approval.'};
         sourceStatus(`${item.name} ${resource}`,url,null,1);
       }catch(error){
@@ -280,7 +290,7 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
       }
     }
     const state={status:errors.length?'partial':'ok',checkedAt:stamp(),errors};
-    return store.upsertCapability({...item,license:licence?.status==='unverified-current-source'?null:licence?.status==='fetched'?licence.spdx:item.license,licenseEvidence:licence,repositoryFiles:files,repositoryEvidence:[commitDoc.evidence,...evidence],sourceState:state,sourceError:errors.length?errors.map(x=>`${x.resource}: ${x.error}`).join('; '):null,sourceHistory:[...(item.sourceHistory||[]),state].slice(-20),provenance:{...item.provenance,resolvedRevision:commit.sha,repositoryFetchedAt:stamp(),commitEvidenceId:commitDoc.evidence.id}}).item;
+    return store.upsertCapability({...item,license:licence?.status==='unverified-current-source'?null:licence?.status==='fetched'?licence.spdx:item.license,licenseEvidence:licence,repositoryFiles:files,repositoryEvidence:[commitDoc.evidence,...evidence],repositoryReadmeProof,sourceState:state,sourceError:errors.length?errors.map(x=>`${x.resource}: ${x.error}`).join('; '):null,sourceHistory:[...(item.sourceHistory||[]),state].slice(-20),provenance:{...item.provenance,resolvedRevision:commit.sha,repositoryFetchedAt:stamp(),commitEvidenceId:commitDoc.evidence.id}}).item;
   };
   const attachSource=async(item,{force=false}={})=>{
     let doc,files;

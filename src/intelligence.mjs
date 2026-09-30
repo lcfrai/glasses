@@ -3,7 +3,8 @@ import { createIntelligenceStore } from './intelligence-store.mjs';
 import { searchTerms } from './store.mjs';
 import { validatePublicURL } from './discovery.mjs';
 import { measureJevClassificationBatch, isDefinitelyUnsentProviderError, ARTIFACTS, ADOPTIONS } from './providers.mjs';
-import { CLASSIFICATION_SCHEMA, CLASSIFICATION_POLICY, LEGACY_CLASSIFICATION_POLICY, classificationFingerprint } from './classification-policy.mjs';
+import { CLASSIFICATION_SCHEMA, CLASSIFICATION_POLICY, LEGACY_CLASSIFICATION_POLICY, classificationFingerprint, registryComponentIdentity, registryIndexItemURL } from './classification-policy.mjs';
+import { repositoryReadmeRefs } from './github-readme.mjs';
 
 export { ARTIFACTS, ADOPTIONS } from './providers.mjs';
 export const INTELLIGENCE_SCHEMA=CLASSIFICATION_SCHEMA;
@@ -25,16 +26,23 @@ function comparePopularity(a,b) {
 function stringArray(value,name,maxItems=20,maxLength=100){if(!Array.isArray(value)||value.length>maxItems||value.some(x=>typeof x!=='string'||!x.trim()||x.length>maxLength))throw fail(`${name} must contain at most ${maxItems} non-empty strings of at most ${maxLength} characters`);return unique(value.map(x=>x.trim()));}
 function publicURL(value){try{return validatePublicURL(value).href;}catch{return null;}}
 function excerpt(snapshot,item,parsedCache){
-  let value=snapshot.body;
+  let value=snapshot.body;const registryIndex=snapshot.url==='https://registry.directory/items.json';
   try {
     let data=parsedCache.get(snapshot.id);if(data===undefined){data=JSON.parse(value);parsedCache.set(snapshot.id,data);}
+    if(registryIndex){
+      if(!registryComponentIdentity(item.url)||!Array.isArray(data.items))return '';
+      const matches=data.items.filter(entry=>registryIndexItemURL(entry)===item.url);
+      // Missing or duplicate identities are not licence to use a different
+      // provider, nor to expose the beginning of the full shared index.
+      return matches.length===1?text(JSON.stringify(matches[0]),2000):'';
+    }
     if(data.encoding==='base64'&&typeof data.content==='string')value=Buffer.from(data.content,'base64').toString('utf8');
     else {
       const entries=Array.isArray(data)?data:data.items||data.registries;
       const selected=Array.isArray(entries)?entries.find(entry=>entry&&(entry.html_url===item.url||entry.url===item.url||entry.full_name===item.name||entry.name===item.name||entry.title===item.name)):null;
       value=selected?JSON.stringify(selected):value;
     }
-  }catch{}
+  }catch{if(registryIndex)return '';}
   return text(value,2000);
 }
 
@@ -58,7 +66,7 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
     const item=store.getCapability(id);if(!item)return null;
     if(item.origin!=='live'||!publicURL(item.url))return null;
     const repositoryEvidence=item.repositoryEvidence||[];
-    const refs=unique([...repositoryEvidence.filter(x=>/\/readme(?:\?|$)/i.test(x.url||'')).map(x=>x.id),item.sourceDocumentEvidence?.id,item.metadataEvidence?.id,item.registryDocumentEvidence?.id,item.provenance?.sourceEvidenceId,item.licenseEvidence?.evidenceId,...repositoryEvidence.map(x=>x.id)].filter(Boolean));
+    const refs=unique([...repositoryReadmeRefs(item),item.sourceDocumentEvidence?.id,item.metadataEvidence?.id,item.registryDocumentEvidence?.id,item.provenance?.sourceEvidenceId,item.licenseEvidence?.evidenceId,...repositoryEvidence.map(x=>x.id)].filter(Boolean));
     const base={id:item.id,name:text(item.name,200),url:item.url,description:text(item.description,1200),provider:text(item.provider,100),sourceKind:item.kind,tags:(item.tags||[]).filter(x=>typeof x==='string').slice(0,15)};
     // Evidence IDs already bind URL + content hash. Catalogue staleness checks
     // must never parse the original multi-megabyte registry body per record.
@@ -326,7 +334,7 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
       for(const key of Object.keys(patch))if(!(key in DEFAULT_INTELLIGENCE_SETTINGS))throw fail(`Unknown intelligence setting: ${key}`);
       const next={...settings,...patch};if(!['codex','jev'].includes(next.provider))throw fail('provider must be codex or jev');
       for(const key of ['autoClassify','autoResearch'])if(typeof next[key]!=='boolean')throw fail(`${key} must be boolean`);
-      for(const [key,min,max] of [['maxCandidates',1,30],['maxJobsPerDay',1,100],['timeoutSeconds',1,600]])if(!Number.isInteger(next[key])||next[key]<min||next[key]>max)throw fail(`${key} must be an integer between ${min} and ${max}`);
+      for(const [key,min,max] of [['maxCandidates',1,30],['maxJobsPerDay',1,500],['timeoutSeconds',1,600]])if(!Number.isInteger(next[key])||next[key]<min||next[key]>max)throw fail(`${key} must be an integer between ${min} and ${max}`);
       for(const [key,max] of [['jevDailyBudgetUsd',100],['confidenceThreshold',1]])if(!Number.isFinite(next[key])||next[key]<0||next[key]>max)throw fail(`${key} must be between 0 and ${max}`);
       settings=next;db.save('settings',{id:'current',value:settings});return getSettings();
     },

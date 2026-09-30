@@ -1,6 +1,6 @@
 {
   "name": "glasses-local",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
   "type": "module",
   "description": "Local discovery catalogue, agent MCP and isolated visual workbench",
@@ -15,6 +15,7 @@
     "mcp": "node src/mcp.mjs",
     "test": "node --test tests/*.test.mjs",
     "verify": "node scripts/verify.mjs",
+    "catalogue:bulk": "node scripts/bulk-scan.mjs",
     "catalogue:fetch": "node scripts/catalogue-setup.mjs --catalogue=import",
     "catalogue:status": "node scripts/catalogue-setup.mjs --status",
     "catalogue:import": "node scripts/export-public-catalogue.mjs --import catalogue/catalogue.json --data-dir .glasses",
