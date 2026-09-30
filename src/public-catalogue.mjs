@@ -4,6 +4,7 @@ import { validatePublicURL } from './discovery.mjs';
 import { stableId, licenseInfo } from './store.mjs';
 import { ARTIFACTS, ADOPTIONS, INTELLIGENCE_SCHEMA } from './intelligence.mjs';
 import { githubRepositoryKind } from './github-kind.mjs';
+import { detectFramework, frameworkTags } from './framework.mjs';
 import { classificationFingerprint, LEGACY_CLASSIFICATION_POLICY, registryComponentIdentity, registryIndexItemURL } from './classification-policy.mjs';
 import { enrichCatalogueDetails } from './catalogue-details.mjs';
 import { publicPageMetadata } from './page-metadata.mjs';
@@ -108,19 +109,18 @@ function projection(item,snapshot) {
     const repo=(Array.isArray(data?.items)?data.items:[data]).find(value=>repoURL(value?.html_url)?.toLowerCase()===repoURL(url)?.toLowerCase());
     if(!repo||repo.private!==false||!repoURL(url))return null;
     if(source.pathname.startsWith('/repositories/')&&(!Number.isSafeInteger(repo.id)||repo.id<1||String(repo.id)!==source.pathname.split('/').at(-1)))return null;
-    const words=`${repo.name||''} ${repo.description||''} ${(repo.topics||[]).join(' ')}`.toLowerCase();
     const recordKind=githubRepositoryKind(repo);
     const stars=Number.isSafeInteger(repo.stargazers_count)&&repo.stargazers_count>=0?repo.stargazers_count:null;
-    fields={name:text(repo.full_name||repo.name,200),description:text(repo.description||'Public repository; inspect upstream for applicability.',1200),kind:recordKind,provider:'GitHub',tags:tags(repo.topics).slice(0,25),framework:/react/.test(words)?'React':null,license:rights(repo.license,'repository'),github:{stars,starsObservedAt:stars===null?null:date(snapshot.lastFetchedAt||snapshot.firstFetchedAt),archived:typeof repo.archived==='boolean'?repo.archived:null}};
+    fields={name:text(repo.full_name||repo.name,200),description:text(repo.description||'Public repository; inspect upstream for applicability.',1200),kind:recordKind,provider:'GitHub',tags:tags(repo.topics).slice(0,25),framework:detectFramework(repo).framework,license:rights(repo.license,'repository'),github:{stars,starsObservedAt:stars===null?null:date(snapshot.lastFetchedAt||snapshot.firstFetchedAt),archived:typeof repo.archived==='boolean'?repo.archived:null}};
     kind=source.pathname==='/search/repositories'?'github-search-metadata':'github-repository-metadata';
   }else if(source.href==='https://registry.directory/items.json'&&Array.isArray(data.items)){
     const row=data.items.find(value=>value?.registry?.basePath&&/^\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(value.registry.basePath)&&`https://registry.directory${value.registry.basePath}/${encodeURIComponent(value.name)}`===url);if(!row)return null;
-    fields={name:text(row.name,200),description:text(row.description||'Component indexed by registry.directory. Inspect source before use.',1200),kind:'component',provider:text(row.registry.name,200),tags:tags(['react',...(row.categories||[]),...(row.type?[row.type]:[])]),framework:'React',license:rights(row.license,'registry-item'),github:null};kind='registry-item-index';
+    fields={name:text(row.name,200),description:text(row.description||'Component indexed by registry.directory. Inspect source before use.',1200),kind:'component',provider:text(row.registry.name,200),tags:tags([...frameworkTags({...row,tags:row.categories}),...(row.categories||[]),...(row.type?[row.type]:[])]),framework:detectFramework({...row,tags:row.categories}).framework,license:rights(row.license,'registry-item'),github:null};kind='registry-item-index';
   }else if(source.href==='https://registry.directory/directory.json'&&Array.isArray(data.registries)){
     const row=data.registries.find(value=>publicLink(value?.url)===url);if(!row)return null;
-    fields={name:text(row.name,200),description:text(row.description,1200),kind:'reference',provider:'registry.directory',tags:tags(['registry','react',...(row.namespace?[row.namespace]:[])]),framework:'React',license:rights(row.license,'registry-provider'),github:null};kind='registry-directory';
+    fields={name:text(row.name,200),description:text(row.description,1200),kind:'reference',provider:'registry.directory',tags:tags(['registry',...frameworkTags(row),...(row.namespace?[row.namespace]:[])]),framework:detectFramework(row).framework,license:rights(row.license,'registry-provider'),github:null};kind='registry-directory';
   }else if(publicLink(snapshot.url)===url&&data&&typeof data==='object'&&Array.isArray(data.files)&&typeof data.name==='string'){
-    fields={name:text(data.title||data.name,200),description:text(data.description||'Registry component source imported for inspection.',1200),kind:'component',provider:source.hostname,tags:['registry','imported','react'],framework:'React',license:rights(data.license,'registry-item'),github:null};kind='registry-item-document';
+    fields={name:text(data.title||data.name,200),description:text(data.description||'Registry component source imported for inspection.',1200),kind:'component',provider:source.hostname,tags:['registry','imported',...frameworkTags(data)],framework:detectFramework(data).framework,license:rights(data.license,'registry-item'),github:null};kind='registry-item-document';
   }else if(publicLink(snapshot.url)===url&&/text\/html/i.test(snapshot.contentType||'')){
     const metadata=publicPageMetadata(snapshot.body);if(!metadata)return null;
     fields={...metadata,kind:'reference',provider:source.hostname,tags:['reference'],framework:null,license:rights(null,'public-page'),github:null};kind='public-page-metadata';
@@ -206,13 +206,15 @@ export function createPublicCatalogue({capabilities,evidence,assessments=[],gene
 export function isNewerPublicItem(previous,item,{previousGeneratedAt,incomingGeneratedAt}={}) {
   if(item.observedAt>previous.observedAt)return true;
   if(item.observedAt!==previous.observedAt||!(incomingGeneratedAt>previousGeneratedAt))return false;
-  // Reassessment can change without a new GitHub metadata observation. Keep
-  // source facts fixed, require a newer publication and reject older/tied
-  // conflicting assessments. A newer publisher may withdraw an assessment.
+  // A newer publisher may correct its derived category/framework/tags or
+  // reassess the same source observation. This accepts attributed publisher
+  // corrections; importing clients do not possess/revalidate upstream bodies.
+  // All other facts and the exact primary source identity/hash stay fixed.
+  // Reject older/tied conflicting assessments; withdrawal remains permitted.
   // Projection places the primary metadata citation first. Assessment attachment
   // can decorate that same citation as source evidence; its identity and bytes
   // must stay identical, while that display role may change.
-  const facts=({assessment,details,citations,...rest})=>{const {kind,...primary}=citations[0];return{...rest,primaryCitation:primary};};
+  const facts=({assessment,details,citations,kind,framework,tags,...rest})=>{const {kind:role,...primary}=citations[0];return{...rest,primaryCitation:primary};};
   if(canonical(facts(previous))!==canonical(facts(item)))return false;
   if(item.assessment&&previous.assessment&&(item.assessment.assessedAt<previous.assessment.assessedAt||item.assessment.assessedAt===previous.assessment.assessedAt&&canonical(item.assessment)!==canonical(previous.assessment)))return false;
   return canonical(item)!==canonical(previous);

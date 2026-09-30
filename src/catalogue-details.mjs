@@ -63,29 +63,68 @@ function directMetadata(data){
   const docs=publicURL(data.documentationUrl||data.documentation_url||data.docs_url);if(docs)result.documentationUrl=docs;
   return result;
 }
-const excludedHeading=/\b(?:licen[cs]e|sponsor\w*|donat\w*|contribut\w*|acknowledge\w*|credits|changelog|release history|table of contents|security policy|code of conduct|support us|contact)\b/i;
+const excludedHeading=/\b(?:licen[cs]e|sponsor\w*|donat\w*|contribut\w*|acknowledge\w*|credits|changelog|release history|table of contents|security policy|code of conduct|support(?:ing)? (?:us|this|the project)|ambassadors|business inquiries|contact)\b/i;
+const purposeHeading=/\b(?:overview|about|introduction|summary|what (?:it|this|is)|why|features?|highlights|capabilities|use cases|functionality|what.+does|feature map)\b/i;
+const setupHeading=/\b(?:install\w*|setup|getting started|quick ?start|docker|gitpod|prerequisites|requirements|build from source|development environment)\b/i;
+const featureHeading=/\b(?:features?|highlights|capabilities|functionality|what.+does|feature map)\b/i;
+function sourceProse(raw){
+  // Language/navigation rows and link-only labels are not product explanations.
+  if(/^\s*(?:\[[^\]]+\]\([^)]*\)[\s|·•/]*)+$/.test(raw))return '';
+  const value=prose(raw);
+  if(/^(?:(?:English|简体中文|繁體中文|中文|日本語|한국어|Deutsch|Français|Español|Português)\s*(?:[|·•/]\s*|$))+$/i.test(value))return '';
+  if(/^(?:Visit|Read|View|See|Check out|Follow|Join|Support)\s+(?:our|the|us|this)\b.*:\s*$/i.test(value))return '';
+  return value;
+}
 function readmeContent(source){
   const data=source.data;if(data?.encoding!=='base64'||typeof data.content!=='string'||data.content.length>512000||!/^[A-Za-z\d+/=\s]+$/.test(data.content))return null;
   const result=Buffer.from(data.content,'base64').toString('utf8');return Buffer.byteLength(result)<=256000?result:null;
 }
 function readmeDetails(body){
   const cleaned=body.replace(/<!--[\s\S]*?-->/g,'').replace(/<(script|style|pre|code)\b[^>]*>[\s\S]*?<\/\1>/gi,'').replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/,'');
-  const paragraphs=[],features=[],sections=[];let current=null,fence=null,skip=false;
+  const paragraphs=[],features=[],sections=[];let current=null,fence=null,excludedLevel=null;
   for(const raw of cleaned.split(/\r?\n/)){
     const mark=raw.match(/^\s*(`{3,}|~{3,})/);if(mark){if(!fence)fence=mark[1][0];else if(fence===mark[1][0])fence=null;continue;}if(fence)continue;
-    const heading=raw.match(/^(#{1,3})\s+(.+)/);
-    if(heading){const title=bounded(prose(heading[2]),100,12);skip=excludedHeading.test(title);current=title&&!skip?{title,lines:[],level:heading[1].length}:null;if(current&&heading[1].length>1)sections.push(current);continue;}
-    if(skip||/^\s{4}|^\s*\||^\s*[-=]{3,}\s*$/.test(raw))continue;
-    const value=prose(raw);if(!value)continue;
+    const heading=raw.match(/^(#{1,6})\s+(.+)/);
+    if(heading){
+      const level=heading[1].length,title=bounded(prose(heading[2]),100,12);
+      if(excludedLevel!==null&&level<=excludedLevel)excludedLevel=null;
+      if(excludedHeading.test(title))excludedLevel=excludedLevel===null?level:Math.min(level,excludedLevel);
+      current=title&&excludedLevel===null?{title,lines:[],level,order:sections.length}:null;
+      if(current&&level>1)sections.push(current);continue;
+    }
+    if(excludedLevel!==null||/^\s{4}|^\s*[-=]{3,}\s*$/.test(raw))continue;
+    if(/^\s*\|/.test(raw)){
+      // Only a source's explicitly labelled feature table. Dependency matrices,
+      // comparisons and arbitrary tables do not become capability claims.
+      if(current&&featureHeading.test(current.title)){
+        const cells=raw.trim().replace(/^\||\|$/g,'').split('|').map(cell=>sourceProse(cell.trim()));
+        if(cells.length===2&&cells.every(Boolean)&&!cells.some(cell=>/^:?-{2,}:?$/.test(cell))
+          &&!(/^(?:feature|capability|function|name)$/i.test(cells[0])&&/^(?:description|details?|purpose)$/i.test(cells[1])))features.push(cells.join(': '));
+      }
+      continue;
+    }
+    const value=sourceProse(raw);if(!value)continue;
     if(current){current.lines.push(value);if(current.level===1)paragraphs.push(value);}else paragraphs.push(value);
-    if(current&&/\b(?:features|highlights|capabilities|what.+does)\b/i.test(current.title)&&/^\s*(?:[-*+]|[✔✓✅])\s+/.test(raw))features.push(value.replace(/^[✔✓✅]\s*/,''));
+    if(current&&featureHeading.test(current.title)&&/^\s*(?:[-*+]|[✔✓✅])\s+/.test(raw))features.push(value.replace(/^[✔✓✅]\s*/,''));
   }
-  const introduction=paragraphs.length?paragraphs:sections.find(section=>/^(?:overview|about|introduction|what is|why)\b/i.test(section.title))?.lines||[];
-  const overview=bounded(introduction.slice(0,3).join(' '),800,55);
+  const substantive=paragraphs.filter(line=>words(line).length>=5||line.length>=20);
+  const introduction=substantive.length?substantive:sections.find(section=>purposeHeading.test(section.title)&&!featureHeading.test(section.title)&&section.lines.length)?.lines||[];
+  const overviewLines=[];for(const line of introduction.slice(0,8)){
+    overviewLines.push(line);const joined=overviewLines.join(' ');
+    // A short complete purpose statement should not absorb the next navigation
+    // or contact label. Wrapped prose can continue until its sentence ends.
+    if(/[.!?。！？]$/.test(line)||words(joined).length>=55)break;
+  }
+  let overview=bounded(overviewLines.join(' '),800,55);
+  if(overview&&!/[.!?。！？…]$/.test(overview)&&overviewLines.length<introduction.length)overview+='…';
   let remaining=180-words(overview).length;const output={...(overview?{overview}:{}),features:[],sections:[]};
   let featureWords=Math.min(70,remaining);
-  for(const line of features){if(output.features.length>=8||featureWords<3)break;const value=bounded(line,180,Math.min(18,featureWords));if(value){output.features.push(value);const count=words(value).length;featureWords-=count;remaining-=count;}}
-  for(const section of sections){
+  for(const line of [...new Set(features)]){if(output.features.length>=8||featureWords<3)break;const value=bounded(line,180,Math.min(18,featureWords));if(value){output.features.push(value);const count=words(value).length;featureWords-=count;remaining-=count;}}
+  // Lead with documented purpose/features, then functional sections, then setup.
+  // Stable ordering within groups preserves the source author's organization.
+  const rank=section=>purposeHeading.test(section.title)?0:setupHeading.test(section.title)?2:1;
+  const functionalSections=sections.filter(section=>!(/^support(?:ing)?\b/i.test(section.title)&&/\b(?:sponsor\w*|donat\w*|funds|funding|patreon|financial support)\b/i.test(section.lines.join(' '))));
+  for(const section of functionalSections.sort((a,b)=>rank(a)-rank(b)||a.order-b.order)){
     if(output.sections.length>=8||remaining<4)break;
     const title=bounded(section.title,100,Math.min(8,remaining-2)),summary=bounded(section.lines.slice(0,2).join(' '),280,Math.min(18,remaining-words(title).length));
     if(!title||!summary)continue;output.sections.push({title,summary});remaining-=words(title+' '+summary).length;

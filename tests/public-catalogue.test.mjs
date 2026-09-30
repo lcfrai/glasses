@@ -120,6 +120,22 @@ test('source bodies are excluded even when registry item JSON embeds code or a s
   assert.equal(output.items.length,1);assert.ok(!JSON.stringify(output).includes('PRIVATE_SOURCE_BODY'));assert.equal(output.items[0].license.scope,'registry-item');
 });
 
+test('framework projection uses exact upstream evidence, not saved labels or generic registry membership',()=>{
+  const cases=[
+    {endpoint:'https://api.github.com/repos/public-lab/memory',data:repo({topics:['vue'],description:'Accessible form controls'}),url:'https://github.com/public-lab/memory',expected:'Vue'},
+    {endpoint:'https://api.github.com/repos/public-lab/memory',data:repo({topics:['data'],description:'A reactive database'}),url:'https://github.com/public-lab/memory',expected:null},
+    {endpoint:'https://registry.directory/items.json',data:{items:[{name:'select',registry:{basePath:'/public/ui',name:'Public UI'},categories:['forms']}]},url:'https://registry.directory/public/ui/select',expected:null},
+    {endpoint:'https://registry.directory/items.json',data:{items:[{name:'select',framework:'Vue',registry:{basePath:'/public/ui',name:'Public UI'}}]},url:'https://registry.directory/public/ui/select',expected:'Vue'},
+    {endpoint:'https://public-ui.dev/r/select.json',data:{name:'select',files:[{path:'Select.vue',content:'<template><select/></template>'}]},url:'https://public-ui.dev/r/select.json',expected:'Vue'},
+    {endpoint:'https://public-ui.dev/r/select.json',data:{name:'select',files:[{path:'Select.tsx',content:'export function Select(){return <select/>}'}]},url:'https://public-ui.dev/r/select.json',expected:null},
+  ];
+  for(const row of cases){
+    const source=evidence(row.endpoint,row.data),cap={url:row.url,origin:'live',framework:'React',tags:['react'],metadataEvidence:source,sourceFiles:[{path:'private.vue',content:'PRIVATE_SOURCE_BODY'}]};
+    const item=createPublicCatalogue({capabilities:[cap],evidence:[source],generatedAt:time}).snapshot.items[0];
+    assert.equal(item.framework,row.expected,row.endpoint);assert.ok(!item.tags.includes('react'));assert.equal(item.citations[0].sha256,source.sha256);assert.ok(!JSON.stringify(item).includes('PRIVATE_SOURCE_BODY'));
+  }
+});
+
 test('corrupt, private, unsupported and credentialled source evidence is excluded without exposing rejection contents',()=>{
   const cases=[input=>{input.evidence[0].body+='tampered';},input=>{input.capabilities[0].origin='seed';},input=>{input.evidence[0].status=404;},input=>{input.capabilities[0].url+='?token=PRIVATE_SECRET';},input=>{input.evidence[0].url='https://user:password@api.github.com/repos/public-lab/memory';},input=>{input.evidence[0].id='forged';}];
   for(const mutate of cases){const input=fixture();mutate(input);const result=createPublicCatalogue(input);assert.equal(result.snapshot.items.length,0);assert.ok(!JSON.stringify(result).includes('PRIVATE_'));}
@@ -256,6 +272,72 @@ test('same-observation reassessment cannot smuggle changed or stale source facts
     const result=mergePublicCatalogues(original,next,{generatedAt:later});
     assert.equal(result.report.conflicts,1,JSON.stringify(options));assert.deepEqual(result.snapshot.items,original.items);
   }
+});
+
+function derivedCorrectionFixture(){
+  const source=createPublicCatalogue(fixture()).snapshot,row=source.items[0];
+  const previous=withPublicCatalogueItems(source,[{...row,kind:'component',framework:'React',tags:['react',...row.tags]}],{generatedAt:time});
+  const corrected=withPublicCatalogueItems(source,[row],{generatedAt:later});
+  return{previous,corrected};
+}
+
+test('a newer publisher can correct category framework and tags for the same immutable source observation',()=>{
+  const {previous,corrected}=derivedCorrectionFixture();
+  const merged=mergePublicCatalogues(previous,corrected,{generatedAt:later});
+  assert.deepEqual(merged.report,{added:0,updated:1,unchanged:0,conflicts:0});
+  assert.deepEqual(merged.snapshot.items,corrected.items);
+  assert.equal(merged.snapshot.items[0].kind,'solution');assert.equal(merged.snapshot.items[0].framework,null);
+  assert.deepEqual(merged.snapshot.items[0].tags,['memory','agent']);
+  assert.equal(merged.snapshot.items[0].observedAt,previous.items[0].observedAt);
+  assert.deepEqual(merged.snapshot.items[0].citations,previous.items[0].citations);
+  assert.deepEqual(mergePublicCatalogues(merged.snapshot,corrected).report,{added:0,updated:0,unchanged:1,conflicts:0});
+  assert.equal(mergePublicCatalogues(merged.snapshot,previous).report.conflicts,1);
+  for(const generatedAt of [time,'2026-09-28T00:00:00.000Z']){
+    const incoming=withPublicCatalogueItems(corrected,corrected.items,{generatedAt});
+    assert.equal(mergePublicCatalogues(previous,incoming).report.conflicts,1);
+  }
+});
+
+test('publisher-derived corrections cannot change primary source facts or roll back model assessments',()=>{
+  const {previous,corrected}=derivedCorrectionFixture();
+  const mutations=[
+    row=>{row.name='A different upstream name';},row=>{row.description='An unrelated purpose';},row=>{row.provider='Different provider';},
+    row=>{row.license.spdx='Apache-2.0';},row=>{row.github.stars++;},
+    row=>{row.citations[0].observedAt=later;},
+    row=>{row.citations[0].sha256='a'.repeat(64);},
+    row=>{row.citations[0].endpoint='https://api.github.com/repos/foreign/source';},
+  ];
+  for(const mutate of mutations){
+    const row=structuredClone(corrected.items[0]);row.assessment=null;mutate(row);
+    const primary=row.citations[0];primary.id=stableId(JSON.stringify({endpoint:primary.endpoint,recordUrl:primary.recordUrl,sha256:primary.sha256}));
+    const incoming=withPublicCatalogueItems(corrected,[row],{generatedAt:later});
+    assert.equal(mergePublicCatalogues(previous,incoming).report.conflicts,1);
+  }
+  for(const assessedAt of [time,'2026-09-28T00:00:00.000Z']){
+    const row=structuredClone(corrected.items[0]);row.assessment={...row.assessment,assessedAt,confidence:0.2};
+    const incoming=withPublicCatalogueItems(corrected,[row],{generatedAt:later});
+    assert.equal(mergePublicCatalogues(previous,incoming).report.conflicts,1);
+  }
+});
+
+test('import applies same-source publisher corrections without overwriting local work or correction overlays',async t=>{
+  const directory=await mkdtemp(join(tmpdir(),'glasses-derived-update-')),store=createStore(directory),intelligence=createIntelligenceStore(directory);
+  t.after(async()=>{intelligence.close();store.close();await rm(directory,{recursive:true,force:true});});
+  const {previous,corrected}=derivedCorrectionFixture(),id=previous.items[0].id;
+  await store.importPublicCatalogue(previous);
+  const workspace=store.createWorkspace({capabilityId:id,source:'export default ()=> <div>Private draft</div>'});
+  store.recordOutcome({capabilityId:id,result:'worked',notes:'Private local outcome'});
+  intelligence.save('corrections',{id,patch:{notes:'Private manual correction'},updatedAt:time});
+  const before={workspace:store.getWorkspace(workspace.id),outcomes:store.outcomes(id),correction:intelligence.get('corrections',id)};
+  assert.equal((await store.importPublicCatalogue(corrected)).updated,1);
+  const shared=store.getCapability(id);assert.equal(shared.kind,'solution');assert.equal(shared.framework,null);assert.deepEqual(shared.tags,['memory','agent']);
+  assert.equal((await store.importPublicCatalogue(corrected)).unchanged,1);
+  assert.deepEqual(store.getWorkspace(workspace.id),before.workspace);assert.deepEqual(store.outcomes(id),before.outcomes);assert.deepEqual(intelligence.get('corrections',id),before.correction);
+  store.upsertCapability({...shared,origin:'live',name:'My independent local title',framework:'Vue',tags:['local-only']});
+  const local=store.getCapability(id);
+  const next=withPublicCatalogueItems(corrected,[{...corrected.items[0],tags:['memory','agent','source-derived']}],{generatedAt:'2026-10-01T00:00:00.000Z'});
+  const report=await store.importPublicCatalogue(next);assert.equal(report.updated,1);assert.equal(report.localOverrides,1);
+  assert.deepEqual(store.getCapability(id),local);assert.deepEqual(intelligence.get('corrections',id),before.correction);
 });
 
 test('a later publisher can add or withdraw an assessment while preserving the exact same upstream observation',()=>{

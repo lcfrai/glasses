@@ -5,6 +5,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { licenseInfo, stableId, searchTerms } from './store.mjs';
 import { githubRepositoryKind } from './github-kind.mjs';
+import { detectFramework, frameworkTags } from './framework.mjs';
 import { MAX_RAW_README_BYTES, rawReadmeDeclaration, verifyRawReadme } from './github-readme.mjs';
 
 const stamp = () => new Date().toISOString();
@@ -116,9 +117,8 @@ function githubMetrics(repo,fetchedAt) {
   return {stars,starsFetchedAt:stars===null?null:fetchedAt||null,fork:typeof repo.fork==='boolean'?repo.fork:null,disabled:typeof repo.disabled==='boolean'?repo.disabled:null};
 }
 function githubRecord(repo,sourceUrl,fetchedAt) {
-  const words=`${repo.name||''} ${repo.description||''} ${(repo.topics||[]).join(' ')}`.toLowerCase();
   const kind=githubRepositoryKind(repo);
-  return {name:repo.full_name||repo.name,url:repo.html_url,description:repo.description||'Public repository; inspect upstream for applicability.',kind,provider:'GitHub',tags:(repo.topics||[]).slice(0,25),...licenseInfo(repo.license),licenseEvidence:{status:'metadata-only',sourceUrl:repo.license?.url||sourceUrl,spdx:repo.license?.spdx_id||null,scope:'repository'},github:{defaultBranch:repo.default_branch||'HEAD',archived:!!repo.archived,pushedAt:repo.pushed_at||null,...githubMetrics(repo,fetchedAt)},framework:/react/.test(words)?'React':null,origin:'live',provenance:{sourceUrl,fetchedAt:stamp(),revision:repo.default_branch?`branch:${repo.default_branch}; pushed:${repo.pushed_at||'unknown'}`:undefined,note:'GitHub repository metadata. Stars are an observed popularity signal, not licence, security or suitability approval. Classification is a keyword heuristic.'}};
+  return {name:repo.full_name||repo.name,url:repo.html_url,description:repo.description||'Public repository; inspect upstream for applicability.',kind,provider:'GitHub',tags:(repo.topics||[]).slice(0,25),...licenseInfo(repo.license),licenseEvidence:{status:'metadata-only',sourceUrl:repo.license?.url||sourceUrl,spdx:repo.license?.spdx_id||null,scope:'repository'},github:{defaultBranch:repo.default_branch||'HEAD',archived:!!repo.archived,pushedAt:repo.pushed_at||null,...githubMetrics(repo,fetchedAt)},framework:detectFramework(repo).framework,origin:'live',provenance:{sourceUrl,fetchedAt:stamp(),revision:repo.default_branch?`branch:${repo.default_branch}; pushed:${repo.pushed_at||'unknown'}`:undefined,note:'GitHub repository metadata. Stars are an observed popularity signal, not licence, security or suitability approval. Classification is a keyword heuristic.'}};
 }
 
 // Backfill only missing popularity fields from the record's existing, exact
@@ -173,7 +173,10 @@ function advanceGitHubPage(store,cursor,data) {
   const bounded=Object.fromEntries(Object.entries(updated).sort((a,b)=>(b[1].lastUsedAt||'').localeCompare(a[1].lastUsedAt||'')).slice(0,100));
   store.setSetting('githubSearchCursors',bounded);
 }
-export function extractPreviewSource(files) {
+export function extractPreviewSource(files,metadata={}) {
+  // The canvas runs React. Retaining Vue/Solid/etc source must not make an
+  // arbitrary uppercase export or TSX filename look like runnable React.
+  if(detectFramework({...metadata,files}).frameworks.some(name=>name!=='React'))return {};
   const scripts=files.filter(f=>/\.[jt]sx?$/.test(f.path||f.name||'')&&typeof f.content==='string');
   const exportedComponent=source=>{
     const direct=source.match(/export\s+(?:function|const|class)\s+([A-Z][A-Za-z0-9_]*)/)?.[1];if(direct)return direct;
@@ -201,6 +204,16 @@ export function normalizeScoutQuery(query) {
 function registrySourceFiles(data,limit) {
   const selected=Array.isArray(data.files)?data.files.filter(file=>file&&typeof file.content==='string'&&file.content.length<=150000).slice(0,limit):[];
   return {files:selected.map(file=>({path:small(file.path||file.name,300),content:file.content})),sourceFileMetadata:selected.map(file=>({path:small(file.path||file.name,300),...(typeof file.target==='string'?{target:small(file.target,1000)}:{}),...(typeof file.type==='string'?{type:small(file.type,100)}:{})}))};
+}
+
+export function markdownSourceFiles(body){
+  const section=body.includes('## Files')?body.slice(body.indexOf('## Files')):body;
+  const languages='tsx|jsx|typescript|javascript|ts|js|vue|svelte|css|scss|html|json';
+  const files=[];
+  for(const [,path,,content] of section.matchAll(new RegExp('###\\s+([^\\n]+)\\n+```('+languages+')[^\\n]*\\n([\\s\\S]*?)```','g')))files.push({path:small(path.trim(),300),content});
+  const extensions={typescript:'ts',javascript:'js'};
+  if(!files.length)for(const [,lang,content] of section.matchAll(new RegExp('```('+languages+')[^\\n]*\\n([\\s\\S]*?)```','g')))files.push({path:`source-${files.length}.${extensions[lang]||lang}`,content});
+  return files.filter(file=>file.content.length<=150000).slice(0,40);
 }
 
 function markdownDependencies(body,source) {
@@ -250,8 +263,9 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
     sourceStatus(`${item.name} source`,attemptedUrl,error);
     return store.upsertCapability({...item,sourceError:state.error,sourceState:state,sourceHistory:[...(item.sourceHistory||[]),state].slice(-20)}).item;
   };
-  const saveSource=(item,doc,files,extra={})=>{
-    const extraction=extractPreviewSource(files);
+  const saveSource=(item,doc,files,extra={},metadata=extra)=>{
+    const framework=detectFramework({...metadata,files});
+    const extraction=extractPreviewSource(files,metadata);
     const state={status:extraction.previewSource?'ok':'unsupported',checkedAt:stamp(),error:extraction.previewSource?null:'Fetched source files have no supported exported React component.',retainedPreviousSource:false};
     sourceStatus(`${item.name} source`,doc.url||item.url,state.error?new Error(state.error):null,files.length);
     const previous=store.getCapability(stableId(item.url));
@@ -259,7 +273,7 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
     const changedPinnedSource=pinned?.licenseEvidence?.scope==='exact-repository-files'&&doc.evidence.sha256!==pinned.provenance?.sourceHash;
     const licence=changedPinnedSource?{license:null,licenseEvidence:{status:'unverified-current-source',scope:'current-source',previous:pinned.licenseEvidence,note:'Current fetched source differs from the previously pinned repository source. Previous licence evidence is retained but does not establish the new source rights.'}}:{};
     const preview=extraction.previewSource?extraction:{previewSource:null,previewFiles:[],previewCss:'',previewProps:{},previewEntryPath:null,sourceEvidence:{files:files.map(file=>({path:file.path||file.name,sha256:createHash('sha256').update(file.content).digest('hex'),bytes:Buffer.byteLength(file.content)})),note:state.error}};
-    return store.upsertCapability({...item,...extra,...licence,...preview,sourceFiles:files,sourceError:state.error,sourceState:state,sourceHistory:[...(item.sourceHistory||previous?.sourceHistory||[]),state].slice(-20),sourceDocumentEvidence:doc.evidence,provenance:{...item.provenance,...(changedPinnedSource?{resolvedRevision:null,previousPinnedRevision:pinned.provenance?.resolvedRevision,previousPinnedFileEvidence:pinned.provenance?.pinnedFileEvidence,pinnedFileEvidence:null}:{}),sourceCodeUrl:doc.url||item.url,sourceFetchedAt:stamp(),sourceHash:doc.evidence.sha256,sourceEvidenceId:doc.evidence.id}}).item;
+    return store.upsertCapability({...item,...extra,...licence,...preview,framework:framework.framework,frameworkEvidence:framework.evidence,sourceFiles:files,sourceError:state.error,sourceState:state,sourceHistory:[...(item.sourceHistory||previous?.sourceHistory||[]),state].slice(-20),sourceDocumentEvidence:doc.evidence,provenance:{...item.provenance,...(changedPinnedSource?{resolvedRevision:null,previousPinnedRevision:pinned.provenance?.resolvedRevision,previousPinnedFileEvidence:pinned.provenance?.pinnedFileEvidence,pinnedFileEvidence:null}:{}),sourceCodeUrl:doc.url||item.url,sourceFetchedAt:stamp(),sourceHash:doc.evidence.sha256,sourceEvidenceId:doc.evidence.id}}).item;
   };
   const attachRepository=async(item)=>{
     const parts=repoParts(item.url);if(!parts)return item;
@@ -319,16 +333,13 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
       doc=await read(item.sourceItemUrl);const data=asJSON(doc);
       const extracted=registrySourceFiles(data,30);files=extracted.files;
       if(!files.length)throw new Error('Source document has no supported source files; inspect the upstream item.');
-      return saveSource(item,doc,files,{sourceFileMetadata:extracted.sourceFileMetadata,dependencies:data.dependencies||[],registryDependencies:data.registryDependencies||[],...(data.license?{...licenseInfo(data.license),licenseEvidence:{status:'metadata-only',scope:'registry-item',sourceUrl:doc.url||item.sourceItemUrl,spdx:data.license,evidenceId:doc.evidence.id}}:{})});
+      return saveSource(item,doc,files,{sourceFileMetadata:extracted.sourceFileMetadata,dependencies:data.dependencies||[],peerDependencies:data.peerDependencies||{},framework:data.framework||null,frameworks:data.frameworks||[],registryDependencies:data.registryDependencies||[],...(item.url===(doc.url||item.sourceItemUrl)?{tags:['registry','imported',...frameworkTags(data)]}:{}),...(data.license?{...licenseInfo(data.license),licenseEvidence:{status:'metadata-only',scope:'registry-item',sourceUrl:doc.url||item.sourceItemUrl,spdx:data.license,evidenceId:doc.evidence.id}}:{})},data);
     }
     const match=item.url.match(/^https:\/\/registry\.directory\/([^/]+)\/([^/]+)\/([^/?#]+)\/?$/);
     if(match) {
       const sourceUrl=`https://registry.directory/api/markdown/${match[1]}/${match[2]}/${match[3]}`;
       doc=await read(sourceUrl);
-      files=[];
-      const fileSection=doc.body.includes('## Files')?doc.body.slice(doc.body.indexOf('## Files')):doc.body;
-      for(const [_,path,lang,content] of fileSection.matchAll(/###\s+([^\n]+)\n+```(tsx|jsx|typescript|javascript|css)[^\n]*\n([\s\S]*?)```/g))files.push({path:small(path.trim(),300),content});
-      if(!files.length)for(const [_,lang,content] of fileSection.matchAll(/```(tsx|jsx|typescript|javascript|css)[^\n]*\n([\s\S]*?)```/g))files.push({path:`source-${files.length}.${lang==='css'?'css':lang==='jsx'?'jsx':'tsx'}`,content});
+      files=markdownSourceFiles(doc.body);
       if(!files.length) throw new Error('Source document has no supported source blocks; inspect the upstream item.');
       return saveSource(item,doc,files,markdownDependencies(doc.body,doc));
     }
@@ -359,7 +370,7 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
       if(parts){const endpoint=`https://api.github.com/repos/${parts.map(encodeURIComponent).join('/')}`;const doc=await read(endpoint),repo=asJSON(doc);if(!repo.html_url)throw new Error('GitHub did not return repository metadata');return store.upsertCapability({...githubRecord(repo,endpoint,doc.evidence.lastFetchedAt),metadataEvidence:doc.evidence}).item;}
       const registryItem=url.match(/^https:\/\/registry\.directory\/([^/]+)\/([^/]+)\/([^/?#]+)\/?$/);
       if(registryItem) {
-        const provisional={name:decodeURIComponent(registryItem[3]),url,description:'Registry component requested for source inspection. Licence and suitability require review.',kind:'component',provider:`${registryItem[1]}/${registryItem[2]}`,tags:['registry','react'],license:null,framework:'React',origin:'live',provenance:{sourceUrl:url,fetchedAt:stamp(),note:'Requested registry item; original source and default-export adaptation are recorded separately.'}};
+        const provisional={name:decodeURIComponent(registryItem[3]),url,description:'Registry component requested for source inspection. Licence and suitability require review.',kind:'component',provider:`${registryItem[1]}/${registryItem[2]}`,tags:['registry'],license:null,framework:null,origin:'live',provenance:{sourceUrl:url,fetchedAt:stamp(),note:'Requested registry item; original source and any React default-export adaptation are recorded separately.'}};
         // Persist only after a real source fetch succeeds; a failed URL is not live evidence.
         return attachSource(provisional);
       }
@@ -368,7 +379,7 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
         const data=asJSON(doc);
         if(Array.isArray(data.files)) {
           const {files,sourceFileMetadata}=registrySourceFiles(data,20);
-          return saveSource({name:data.title||data.name||new URL(url).hostname,url,sourceItemUrl:url,description:small(data.description)||'Registry component source imported for inspection.',kind:'component',provider:new URL(url).hostname,tags:['registry','imported','react'],...licenseInfo(data.license),licenseEvidence:{status:'metadata-only',scope:'registry-item',sourceUrl:url,spdx:data.license||null,evidenceId:doc.evidence.id},framework:'React',origin:'live',dependencies:data.dependencies||[],registryDependencies:data.registryDependencies||[],sourceFileMetadata,provenance:{sourceUrl:doc.url||url,fetchedAt:stamp(),revision:doc.evidence.sha256,note:'Registry source fetched as data. Not installed or approved; unsupported dependencies must be reviewed.'}},doc,files);
+          return saveSource({name:data.title||data.name||new URL(url).hostname,url,sourceItemUrl:url,description:small(data.description)||'Registry component source imported for inspection.',kind:'component',provider:new URL(url).hostname,tags:['registry','imported',...frameworkTags(data)],...licenseInfo(data.license),licenseEvidence:{status:'metadata-only',scope:'registry-item',sourceUrl:url,spdx:data.license||null,evidenceId:doc.evidence.id},framework:null,origin:'live',dependencies:data.dependencies||[],registryDependencies:data.registryDependencies||[],sourceFileMetadata,provenance:{sourceUrl:doc.url||url,fetchedAt:stamp(),revision:doc.evidence.sha256,note:'Registry source fetched as data. Not installed or approved; unsupported dependencies must be reviewed.'}},doc,files,{framework:data.framework,frameworks:data.frameworks,dependencies:data.dependencies||[],peerDependencies:data.peerDependencies||{}},data);
         }
       }
       const clean=s=>small((s||'').replace(/<[^>]+>/g,' ').replace(/&(?:quot|#34);/g,'"').replace(/&amp;/g,'&').replace(/\s+/g,' ').trim());
@@ -376,7 +387,7 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
       const description=clean(doc.body.match(/<meta[^>]*(?:name|property)=["'](?:description|og:description)["'][^>]*content=["']([^"']*)/i)?.[1]);
       let item=store.upsertCapability({name:title,url,description:description||'Imported public reference. No reusable-source or licence evidence established.',kind:'reference',provider:new URL(url).hostname,tags:['imported','reference'],license:null,framework:null,origin:'live',metadataEvidence:doc.evidence,provenance:{sourceUrl:doc.url||url,fetchedAt:stamp(),revision:doc.evidence.sha256,note:'Public page metadata only; website appearance does not grant reuse rights.'}}).item;
       if(/^https:\/\/registry\.directory\/[^/]+\/[^/]+\/[^/]+\/?$/.test(url)) {
-        item=store.upsertCapability({...item,kind:'component',framework:'React'}).item;
+        item=store.upsertCapability({...item,kind:'component',framework:null}).item;
         try{item=await attachSource(item);}catch(error){item=store.upsertCapability({...item,sourceError:errorMessage(error)}).item;}
       }
       return item;
@@ -405,7 +416,7 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
           for(const registry of registries.slice(0,200)) {
             const url=publicHref(registry.url);if(!url)continue;
             if(!matchesBrief(registry.name,registry.description,registry.namespace,registry.url,registry.tags))continue;
-            save({name:registry.name,url,description:registry.description,kind:'reference',provider:'registry.directory',tags:['registry','react',...(registry.namespace?[registry.namespace]:[])],...licenseInfo(registry.license),framework:'React',origin:'live',registryUrl:publicHref(registry.registry_url),githubUrl:publicHref(registry.github_url),metadataEvidence:doc.evidence,provenance:{sourceUrl:'https://registry.directory/directory.json',fetchedAt:stamp(),note:'Discovered provider metadata. Provider listing is not a licence or security assessment.'}});
+            save({name:registry.name,url,description:registry.description,kind:'reference',provider:'registry.directory',tags:['registry',...frameworkTags(registry),...(registry.namespace?[registry.namespace]:[])],...licenseInfo(registry.license),framework:detectFramework(registry).framework,origin:'live',registryUrl:publicHref(registry.registry_url),githubUrl:publicHref(registry.github_url),metadataEvidence:doc.evidence,provenance:{sourceUrl:'https://registry.directory/directory.json',fetchedAt:stamp(),note:'Discovered provider metadata. Provider listing is not a licence or security assessment.'}});
           }
           return registries.length;
         });
@@ -420,7 +431,7 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
             const base=String(entry.registry.basePath);if(!/^\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(base))continue;
             const url=`https://registry.directory${base}/${encodeURIComponent(entry.name)}`;
             const provider=registries.find(x=>x.name===entry.registry.name);
-            save({name:entry.name,url,description:entry.description||'Component indexed by registry.directory. Inspect source before use.',kind:'component',provider:entry.registry.name,tags:['react',...(entry.categories||[]),...(entry.type?[entry.type]:[])],...licenseInfo(entry.license),framework:'React',origin:'live',githubUrl:publicHref(provider?.github_url),metadataEvidence:doc.evidence,provenance:{sourceUrl:'https://registry.directory/items.json',fetchedAt:stamp(),note:'Index metadata only. Licence is unknown unless explicitly supplied; no compatibility or security approval.'}});
+            save({name:entry.name,url,description:entry.description||'Component indexed by registry.directory. Inspect source before use.',kind:'component',provider:entry.registry.name,tags:[...frameworkTags({...entry,tags:entry.categories}),...(entry.categories||[]),...(entry.type?[entry.type]:[])],...licenseInfo(entry.license),framework:detectFramework({...entry,tags:entry.categories}).framework,origin:'live',githubUrl:publicHref(provider?.github_url),metadataEvidence:doc.evidence,provenance:{sourceUrl:'https://registry.directory/items.json',fetchedAt:stamp(),note:'Index metadata only. Licence is unknown unless explicitly supplied; no compatibility or security approval.'}});
           }
           store.setSetting('itemOffset',offset+160);return selected.length;
         });
@@ -436,7 +447,8 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
             const url=publicHref(entry.url)||`${provider.url.replace(/\/$/,'')}/#glasses-item-${encodeURIComponent(entry.name||'unnamed')}`;
             const files=Array.isArray(entry.files)?entry.files.filter(f=>typeof f.content==='string'&&f.content.length<150000).slice(0,10):[];
             const sourceItemUrl=/\/registry\.json(?:\?.*)?$/.test(provider.registry_url)?publicHref(provider.registry_url.replace(/registry\.json(?:\?.*)?$/,`${encodeURIComponent(entry.name)}.json`)):null;
-            save({name:entry.title||entry.name,url,sourceItemUrl,githubUrl:publicHref(provider.github_url),description:entry.description||'Provider registry metadata; source may require upstream retrieval.',kind:'component',provider:provider.name,tags:['react','registry'],...licenseInfo(entry.license),framework:'React',origin:'live',metadataEvidence:doc.evidence,...(files.length?{sourceFiles:files,...extractPreviewSource(files)}:{}),provenance:{sourceUrl:provider.registry_url,fetchedAt:stamp(),note:'Fetched provider registry. Missing licence evidence is retained as unknown.'}});
+            const preview=extractPreviewSource(files,entry);
+            save({name:entry.title||entry.name,url,sourceItemUrl,githubUrl:publicHref(provider.github_url),description:entry.description||'Provider registry metadata; source may require upstream retrieval.',kind:'component',provider:provider.name,tags:[...frameworkTags({...entry,files}),'registry'],...licenseInfo(entry.license),framework:detectFramework({...entry,files}).framework,origin:'live',metadataEvidence:doc.evidence,...(files.length?{sourceFiles:files,...(preview.previewSource?preview:{previewSource:null,previewFiles:[],previewEntryPath:null}),sourceState:{status:preview.previewSource?'ok':'unsupported',checkedAt:stamp(),error:preview.previewSource?null:'Fetched source files have no supported exported React component.'}}:{}),provenance:{sourceUrl:provider.registry_url,fetchedAt:stamp(),note:'Fetched provider registry. Missing licence evidence is retained as unknown.'}});
           }
           return entries.length;
         });

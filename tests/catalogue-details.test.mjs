@@ -186,6 +186,40 @@ test('keywords come from declared metadata fields only and stay bounded without 
   assert.ok(!JSON.stringify(row.details).includes('PRIVATE_CODE_KEYWORD'));
 });
 
+test('purpose and functions lead source details while language rows and sponsor subtrees stay out',()=>{
+  const metadata=source('https://api.github.com/repos/public-lab/planner',{private:false}),row=item('https://github.com/public-lab/planner','Planner',metadata);
+  const body='# Planner\n[English](https://example.org/en) | 中文\n## Sponsors\nSponsor message\n### Platinum\nPRIVATE_SPONSOR_COPY\n## Installation\nInstall the desktop application using the documented package for your platform.\n## What it is\nPlan projects, schedule milestones and track dependencies in a shared workspace.\n## Capabilities\n| Feature | Description |\n| --- | --- |\n| Timeline | Schedule tasks and inspect dependent milestones. |\n| Offline edits | Keep working locally and synchronize later. |\n## Approvals\nReview proposed changes before merging them into the shared plan.';
+  const details=enrichCatalogueDetails({items:[row],evidence:[readme('public-lab/planner',body)]})[0].details;
+  assert.match(details.overview,/Plan projects/);assert.ok(!JSON.stringify(details).includes('PRIVATE_SPONSOR_COPY'));assert.ok(!details.overview.includes('English'));
+  assert.deepEqual(details.features,['Timeline: Schedule tasks and inspect dependent milestones.','Offline edits: Keep working locally and synchronize later.']);
+  assert.equal(details.sections[0].title,'What it is');assert.ok(details.sections.findIndex(x=>x.title==='Approvals')<details.sections.findIndex(x=>x.title==='Installation'));
+});
+
+test('source feature tables exclude commands, comparison matrices and misleading headers',()=>{
+  const metadata=source('https://api.github.com/repos/public-lab/table',{private:false}),row=item('https://github.com/public-lab/table','Table',metadata);
+  const body='# Table\nA source-backed tool for evaluating documented task results.\n## Features\n| Feature | Description |\n| :--- | ---: |\n| Search | Find saved documents by keyword. |\n| Script | `runCommand()` |\n| Us | Competitor | Score |\n| Alpha | Beta | 99 |\n## Dependencies\n| Vendor | Full capability claim that must not be adopted. |';
+  const details=enrichCatalogueDetails({items:[row],evidence:[readme('public-lab/table',body)]})[0].details;
+  assert.deepEqual(details.features,['Search: Find saved documents by keyword.']);assert.ok(!JSON.stringify(details).includes('runCommand'));assert.ok(!JSON.stringify(details).includes('Full capability'));
+});
+
+test('brief and CJK purpose statements survive language navigation cleanup',()=>{
+  const metadata=source('https://api.github.com/repos/public-lab/monitor',{private:false}),row=item('https://github.com/public-lab/monitor','Monitor',metadata);
+  for(const purpose of ['Delightful Swift snapshot testing.','一个针对高并发、低延迟应用设计的高性能 Java 性能监控和统计工具。']){
+    const details=enrichCatalogueDetails({items:[row],evidence:[readme('public-lab/monitor','# Monitor\n简体中文 | English\n'+purpose)]})[0].details;
+    assert.equal(details.overview,purpose);
+  }
+});
+
+test('a complete short purpose stops before contact labels while wrapped sentences remain readable',()=>{
+  const metadata=source('https://api.github.com/repos/public-lab/store',{private:false}),row=item('https://github.com/public-lab/store','Store',metadata);
+  const short='An open-source commerce application for managing your store.';
+  let details=enrichCatalogueDetails({items:[row],evidence:[readme('public-lab/store','# Store\n'+short+'\nStore Security: mailing list') ]})[0].details;
+  assert.equal(details.overview,short);
+  const lines=['A local workspace that lets a team','collect requirements,','review proposed changes,','and track releases in a shared project.'];
+  details=enrichCatalogueDetails({items:[row],evidence:[readme('public-lab/store','# Store\n'+lines.join('\n'))]})[0].details;
+  assert.equal(details.overview,lines.join(' '));
+});
+
 test('explicit community lists and enumerated teaching notebooks are typed without relabelling notebook applications',()=>{
   const metadata=source('https://api.github.com/repos/public-lab/resource',{private:false}),row=item('https://github.com/public-lab/resource','Resource',metadata);
   for(const [description,body,expected] of [

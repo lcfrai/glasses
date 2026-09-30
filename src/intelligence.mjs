@@ -5,6 +5,8 @@ import { validatePublicURL } from './discovery.mjs';
 import { measureJevClassificationBatch, isDefinitelyUnsentProviderError, ARTIFACTS, ADOPTIONS } from './providers.mjs';
 import { CLASSIFICATION_SCHEMA, CLASSIFICATION_POLICY, LEGACY_CLASSIFICATION_POLICY, classificationFingerprint, registryComponentIdentity, registryIndexItemURL } from './classification-policy.mjs';
 import { repositoryReadmeRefs } from './github-readme.mjs';
+import { purposeAnchor, purposeEvidence } from './purpose-matching.mjs';
+import { detectFramework } from './framework.mjs';
 
 export { ARTIFACTS, ADOPTIONS } from './providers.mjs';
 export const INTELLIGENCE_SCHEMA=CLASSIFICATION_SCHEMA;
@@ -107,7 +109,9 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
   }
   function decorate(items,{query='',artifact}={}) {
     boundedText(query,'query',500);if(artifact&&artifact!=='all'&&!ARTIFACTS.includes(artifact))throw fail('Invalid artifact filter');
-    const terms=searchTerms(query);
+    const terms=searchTerms(query),anchor=purposeAnchor(query),exactQuery=query.normalize('NFKC').trim().toLowerCase();
+    const positiveFrameworkQuery=exactQuery.replace(/\b(?:without|excluding|except|not|no)\s+([^,;.!?]+)/g,(_whole,tail)=>tail.split(/\b(?:but|and|while|with|for|that|which)\b/).slice(1).join(' '));
+    const requestedFrameworks=detectFramework({frameworks:positiveFrameworkQuery.match(/\b(?:react(?:js|\.js)?|vue(?:js|\.js|[23])?|svelte(?:js)?|angular|solid(?:js|\.js)?|preact)\b/gi)||[]}).frameworks;
     const outcomeText=new Map();
     if(terms.length)for(const outcome of store.outcomes())outcomeText.set(outcome.capabilityId,`${outcomeText.get(outcome.capabilityId)||''} ${outcome.result||''} ${outcome.notes||''} ${Object.values(outcome.context||{}).join(' ')}`.toLowerCase());
     return items.map(item=>{
@@ -115,8 +119,25 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
       const shared=item.origin==='shared'&&item.sharedAssessment?[item.sharedAssessment.artifact,item.sharedAssessment.adoption,...(item.sharedAssessment.capabilities||[])].join(' ').toLowerCase():'';
       const fields={name:text(item.name).toLowerCase(),tags:(item.tags||[]).join(' ').toLowerCase(),description:text(item.description,4000).toLowerCase(),provider:text(item.provider).toLowerCase(),kind:item.kind,framework:text(item.framework).toLowerCase(),outcomes:outcomeText.get(item.id)||'',inferred,sharedInferred:shared,sourceDetails:[item.details?.overview,...item.details?.features||[],...item.details?.keywords||[],...(item.details?.sections||[]).map(section=>section.title+' '+section.summary)].filter(Boolean).join(' ').toLowerCase()};
       const matches=terms.filter(term=>Object.values(fields).some(value=>String(value).includes(term)));
-      const score=terms.reduce((sum,term)=>sum+(fields.name.includes(term)?4:0)+(fields.tags.includes(term)?3:0)+(fields.description.includes(term)?1:0)+(inferred.includes(term)?3:0)+(shared.includes(term)?2:0)+(fields.sourceDetails.includes(term)?1:0),0);
-      return {...item,assessment:info,matchReason:terms.length?`Text matched: ${matches.join(', ')} (${matches.length}/${terms.length} terms), including inferred labels and local outcome context${matches.some(term=>shared.includes(term))?'; attributed shared labels are not locally verified':''}. Classification is not verified compatibility.`:item.matchReason,_matches:matches.length,_score:score};
+      let score=terms.reduce((sum,term)=>sum+(fields.name.includes(term)?4:0)+(fields.tags.includes(term)?3:0)+(fields.framework.includes(term)?3:0)+(fields.description.includes(term)?1:0)+(inferred.includes(term)?3:0)+(shared.includes(term)?2:0)+(fields.sourceDetails.includes(term)?1:0),0);
+      // Repeated mentions of one easy term should not outrank evidence for the
+      // complete request. Retain partial candidates rather than treating missing
+      // metadata as a hard incompatibility; exact identities still win below.
+      const coverage=terms.length?matches.length/terms.length:1;
+      score*=0.3+0.7*coverage*coverage;
+      const exact=exactQuery&&(fields.name===exactQuery||text(item.url,4000).toLowerCase()===exactQuery||item.id===exactQuery),purpose=purposeEvidence(anchor,fields);
+      if(anchor&&!exact)score=score*purpose.weight+purpose.bonus;
+      let frameworkExcluded=false;
+      if(requestedFrameworks.length&&item.kind==='component'&&!exact){
+        // Only declared/source facts identify a framework. Inferred labels and
+        // JSX syntax do not, and whole tools retain their existing behaviour.
+        const sourceFrameworks=detectFramework({framework:item.framework,frameworks:text(item.framework).split(/\s*[/,|]\s*/),tags:item.tags,description:item.description,dependencies:item.details?.dependencies}).frameworks;
+        frameworkExcluded=sourceFrameworks.length>0&&!sourceFrameworks.some(name=>requestedFrameworks.includes(name));
+        if(!sourceFrameworks.length)score*=.65;
+        else if(!frameworkExcluded)score+=3*sourceFrameworks.filter(name=>requestedFrameworks.includes(name)).length;
+      }
+      if(exact)score+=500;
+      return {...item,assessment:info,matchReason:terms.length?`Text matched: ${matches.join(', ')} (${matches.length}/${terms.length} terms), including inferred labels and local outcome context${matches.some(term=>shared.includes(term))?'; attributed shared labels are not locally verified':''}${anchor?`; ${anchor} purpose: ${purpose.level}`:''}. Classification is not verified compatibility.`:item.matchReason,_matches:frameworkExcluded?0:matches.length||Number(purpose.matched)||Number(exact),_score:score};
     }).filter(item=>(!terms.length||item._matches)&&(!artifact||artifact==='all'||item.assessment?.artifact===artifact)).sort((a,b)=>b._score-a._score||comparePopularity(a,b)).map(({_matches,_score,...item})=>item);
   }
   async function providerState(){const state=await providers.status?.()||{};for(const provider of ['codex','jev'])if(state[provider]?.model)observedModels[provider]=state[provider].model;return state;}

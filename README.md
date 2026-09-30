@@ -4,13 +4,15 @@ Find existing software before rebuilding it. Glasses gives coding agents a searc
 
 [Browse the public catalogue](https://lcfr.ai/glasses). The catalogue is a versioned public snapshot; research and private project work run on your own machine.
 
-Release **0.3.2** adds resumable bulk discovery across tools, components, skills, agents, collections and references. It also makes the release's **59 static source previews** visible through card thumbnails, a **Has preview** filter and direct links to individual catalogue entries. These captures show documented examples; they are not executable demos or proof that a component fits your project.
+Release **0.3.3** improves source descriptions: documented purpose and functions come before setup instructions, explicit feature tables are retained, and navigation/fundraising text is filtered. Registry frameworks are derived from source evidence instead of assuming every registry component uses React. Bulk discovery remains resumable across tools, components, skills, agents, collections and references. Dated source previews appear in card thumbnails, a **Has preview** filter and direct item links. These captures are documentation examples, not executable demos or compatibility tests.
+
+Search also gives more weight to source-documented spreadsheet and threat-modelling purposes, so generic browser or model terminology is less likely to dominate those requests. This is discovery ranking, not a compatibility guarantee.
 
 ## Run locally
 
 Requires Node.js 24 or later and npm. The local interface binds to `127.0.0.1:4317`.
 
-This README describes source release **0.3.2**. The setup command requires this version's `scripts/setup.mjs`; a public checkout still on 0.3.0 needs the manual commands below. There is no published `npx` installer.
+This README describes source release **0.3.3**. The setup command requires this version's `scripts/setup.mjs`; a public checkout still on 0.3.0 needs the manual commands below. There is no published `npx` installer.
 
 **Upgrading from 0.3.0 or 0.3.1:** update the client before importing the new snapshot. Version 0.3.0 does not recognize expanded adoption routes such as `install-app`, `run-cli` and `use-hosted`; version 0.3.1 does not support the new public-page evidence. Keep your existing `.glasses` data directory when replacing source files, then run `npm ci` and `npm run build`. Local notes, workspaces and human corrections remain separate from shared metadata.
 
@@ -23,7 +25,7 @@ node scripts/setup.mjs
 npm start
 ```
 
-For the downloaded 0.3.2 source package, extract it and run the final two commands in its folder. Setup installs this repository's locked dependencies if they are missing, builds the local interface and asks **“Fetch latest catalogue now? [y/N]”**. Yes fetches `https://lcfr.ai/glasses/catalogue.json`; No saves your choice and leaves Glasses usable. A noninteractive terminal without an explicit flag leaves the choice pending and makes no catalogue request. Setup does not start a server or register an agent automatically.
+For the downloaded 0.3.3 source package, extract it and run the final two commands in its folder. Setup installs this repository's locked dependencies if they are missing, builds the local interface and asks **“Fetch latest catalogue now? [y/N]”**. Yes fetches `https://lcfr.ai/glasses/catalogue.json`; No saves your choice and leaves Glasses usable. A noninteractive terminal without an explicit flag leaves the choice pending and makes no catalogue request. Setup does not start a server or register an agent automatically.
 
 Open <http://127.0.0.1:4317>. If setup has not recorded a choice, the local app offers the same Yes/No choice. No shared catalogue is fetched until you approve it. Use **Shared catalogue** in the app to import later or retry, or run:
 
@@ -36,7 +38,7 @@ Each fetch command is an explicit one-time import; consent does not enable autom
 
 For scripted setup, `node scripts/setup.mjs --catalogue=import` or `--catalogue=decline` records an explicit choice. `--data-dir DIRECTORY` uses an isolated data directory. To use that same custom directory when starting the server, set `GLASSES_DATA_DIR`; without it the app uses `.glasses` beside this checkout.
 
-Manual build/start works with both 0.3.0 and 0.3.2:
+Manual build/start works with all source releases:
 
 ```sh
 npm ci
