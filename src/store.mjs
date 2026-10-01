@@ -13,6 +13,15 @@ export const OPEN_LICENSES = new Set(['MIT','Apache-2.0','BSD-2-Clause','BSD-3-C
 export const stableId = value => createHash('sha256').update(value).digest('hex').slice(0, 20);
 const now = () => new Date().toISOString();
 const parse = row => row ? JSON.parse(row.data) : null;
+// Count the merged identity set in SQLite without materializing source summaries.
+// Local kind wins even when a shared publication classifies that ID differently.
+const countsSQL = `SELECT kind, COUNT(*) AS count FROM (
+  SELECT json_extract(data, '$.kind') AS kind FROM capabilities
+  UNION ALL
+  SELECT json_extract(shared.data, '$.item.kind') AS kind
+  FROM shared_capabilities AS shared
+  WHERE NOT EXISTS (SELECT 1 FROM capabilities AS local WHERE local.id = shared.id)
+) GROUP BY kind`;
 const text = (value, max = 2000) => typeof value === 'string' ? value.slice(0, max) : '';
 const STOP_WORDS=new Set('a an and are as at be been build building built but by can could do does for from get give has have how i if in into is it its me my need of on or our please should some something that the their them there these they this to use using want was we what when where which will with would you your'.split(' '));
 export const searchTerms=query=>query.toLowerCase().replace(/[^a-z0-9+#.-]+/g,' ').split(/\s+/).filter(word=>word.length>=2&&!STOP_WORDS.has(word)).slice(0,20);
@@ -36,7 +45,9 @@ export function createStore(dataDir = process.env.GLASSES_DATA_DIR || '.glasses'
     CREATE TABLE IF NOT EXISTS design_reviews (id TEXT PRIMARY KEY, data TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, data TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, data TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS evidence (id TEXT PRIMARY KEY, data TEXT NOT NULL);`);
+    CREATE TABLE IF NOT EXISTS evidence (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS capabilities_kind_counts ON capabilities(json_extract(data, '$.kind'));
+    CREATE INDEX IF NOT EXISTS shared_capabilities_kind_counts ON shared_capabilities(json_extract(data, '$.item.kind'), id);`);
   const all = table => db.prepare(`SELECT data FROM ${table}`).all().map(parse);
   const get = (table, id) => parse(db.prepare(`SELECT data FROM ${table} WHERE id=?`).get(id));
   const save = (table, data) => {db.prepare(`INSERT INTO ${table} (id,data) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data`).run(data.id, JSON.stringify(data)); return data;};
@@ -59,7 +70,11 @@ export function createStore(dataDir = process.env.GLASSES_DATA_DIR || '.glasses'
   };
   const withSharedDetails=(local,shared)=>{if(!local)return shared;if(local.details&&!local.detailsPublication&&!local.sharedPublication||!shared?.details)return local;return {...local,details:shared.details,detailsCitations:shared.sharedCitations,detailsBasis:'Published source details from '+shared.sharedPublication.generatedAt+'; inspect current local source before adoption.',detailsPublication:shared.sharedPublication};};
   const capability = id => withSharedDetails(get('capabilities',id),sharedCapability(get('shared_capabilities',id)));
-  const capabilities = () => {const items=new Map(all('shared_capabilities').map(row=>[row.id,sharedCapability(row)]));for(const item of all('capabilities'))items.set(item.id,withSharedDetails(item,items.get(item.id)));return [...items.values()];};
+  const summarySQL="SELECT json_remove(data,'$.repositoryFiles','$.sourceFiles','$.previewFiles','$.previewSource','$.previewCss','$.previewProps') AS data FROM capabilities";
+  const summaryById=db.prepare(summarySQL+' WHERE id=?'),sharedById=db.prepare('SELECT data FROM shared_capabilities WHERE id=?');
+  const capabilitySummary=id=>withSharedDetails(parse(summaryById.get(id)),sharedCapability(parse(sharedById.get(id))));
+  const capabilities = () => {const items=new Map(all('shared_capabilities').map(row=>[row.id,sharedCapability(row)]));for(const row of db.prepare(summarySQL).all()){const item=parse(row);items.set(item.id,withSharedDetails(item,items.get(item.id)));}return [...items.values()];};
+  const countsStatement=db.prepare(countsSQL);
   return {
     directory, close: () => db.close(),
     designReviews: () => all('design_reviews').sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)||a.id.localeCompare(b.id)),
@@ -67,17 +82,24 @@ export function createStore(dataDir = process.env.GLASSES_DATA_DIR || '.glasses'
     createDesignReview: input => save('design_reviews',makeDesignReview(input)),
     updateDesignReview: (id,input) => mutateDesignReview(id,previous=>reviseDesignReview(previous,input)),
     decideDesignReview: (id,input) => mutateDesignReview(id,previous=>decideDesignReview(previous,input)),
-    retainEvidence({url,body,contentType='',status=200,transport='direct',fetchedAt=now()}) {
+    retainEvidence({url,body,contentType='',status=200,transport='direct',fetchedAt=now(),request}) {
       if(typeof body!=='string') throw new Error('Evidence requires the exact fetched text');
       const sha256=createHash('sha256').update(body).digest('hex');
       const id=stableId(`${url}\n${sha256}`),previous=get('evidence',id);
-      const snapshot={id,url,sha256,bytes:Buffer.byteLength(body),contentType,status,transport,firstFetchedAt:previous?.firstFetchedAt||fetchedAt,lastFetchedAt:fetchedAt,body};
+      let requestReceipt=previous?.request;
+      if(request!==undefined){
+        if(url!=='https://api.github.com/graphql'||request?.method!=='POST'||typeof request.body!=='string'||Buffer.byteLength(request.body)>100000||Object.keys(request).some(key=>!['method','body'].includes(key)))throw new Error('Unsupported source request receipt');
+        requestReceipt={method:'POST',body:request.body};
+        if(previous?.request&&JSON.stringify(previous.request)!==JSON.stringify(requestReceipt))throw new Error('Existing response evidence is bound to a different request');
+      }
+      const snapshot={id,url,sha256,bytes:Buffer.byteLength(body),contentType,status,transport,firstFetchedAt:previous?.firstFetchedAt||fetchedAt,lastFetchedAt:fetchedAt,body,...(requestReceipt?{request:requestReceipt,requestSha256:createHash('sha256').update(requestReceipt.body).digest('hex')}:{})};
       save('evidence',snapshot);
-      const {body:raw,...summary}=snapshot;return summary;
+      const {body:raw,request:requestBody,...summary}=snapshot;return summary;
     },
     getEvidence:id=>get('evidence',id),
-    evidence:()=>all('evidence').map(({body,...summary})=>summary),
+    evidence:()=>all('evidence').map(({body,request,...summary})=>summary),
     getCapability: capability,
+    getCapabilitySummary: capabilitySummary,
     async importPublicCatalogue(input) {
       // Dynamic import avoids making the local store depend on projection initialization.
       // Validation completes before the one-table transaction; no network/model hook runs.
@@ -128,7 +150,11 @@ export function createStore(dataDir = process.env.GLASSES_DATA_DIR || '.glasses'
         return {...item,outcomeSummary, _score: score, matchReason: terms.length ? `Text matched: ${matches.join(', ')} (${matches.length}/${terms.length} terms), including recorded local outcome context where present. No semantic or compatibility assessment.` : 'Catalogue entry; no fit assessment requested.', _matches: matches.length};
       }).filter(x=>!terms.length||x._matches>0).sort((a,b)=>b._score-a._score || a.name.localeCompare(b.name)).map(({_score,_matches,sourceFiles,previewFiles,repositoryFiles,previewSource,previewCss,previewProps,...item})=>item);
     },
-    counts() {const items=capabilities();return Object.fromEntries([['total',items.length],...KINDS.map(kind=>[kind,items.filter(x=>x.kind===kind).length])]);},
+    counts() {
+      const counts=Object.fromEntries([['total',0],...KINDS.map(kind=>[kind,0])]);
+      for(const row of countsStatement.all()){counts.total+=row.count;if(KINDS.includes(row.kind))counts[row.kind]=row.count;}
+      return counts;
+    },
     getSetting(key, fallback) {return parse(db.prepare('SELECT data FROM settings WHERE key=?').get(key)) ?? fallback;},
     setSetting(key, value) {db.prepare('INSERT INTO settings (key,data) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data').run(key,JSON.stringify(value));return value;},
     acquireSettingLease(key, lease) {

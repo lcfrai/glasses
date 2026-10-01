@@ -74,5 +74,8 @@ test('local query coverage prefers task plus framework over repeated framework a
  const repeated=add('Database operations','Database administration platform',null,'solution',['database']);
  const complete=add('Backup service','Database backup service',null,'solution');
  assert.equal(engine.decorate([repeated,complete],{query:'database backup'})[0].id,complete.id,'Coverage is a general rule, not a component or framework-name boost');
+ const grid=add('Infinite Grid','A React grid background with animated lines','React'),table=add('Record table','A data table for viewing records','React');
+ assert.equal(engine.decorate([grid,table],{query:'React data table'})[0].id,table.id,'Decorative layout grids do not establish data-table purpose');
+ assert.equal(engine.decorate([grid,table],{query:grid.id})[0].id,grid.id,'Layout sources remain available by exact identity');
  assert.equal((await engine.status()).usageToday.calls,0);
 });

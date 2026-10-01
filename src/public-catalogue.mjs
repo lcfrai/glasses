@@ -1,19 +1,22 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { validatePublicURL } from './discovery.mjs';
+import { validatePublicURL, markdownSourceFiles, markdownDependencies } from './discovery.mjs';
 import { stableId, licenseInfo } from './store.mjs';
 import { ARTIFACTS, ADOPTIONS, INTELLIGENCE_SCHEMA } from './intelligence.mjs';
 import { githubRepositoryKind } from './github-kind.mjs';
 import { detectFramework, frameworkTags } from './framework.mjs';
-import { classificationFingerprint, LEGACY_CLASSIFICATION_POLICY, registryComponentIdentity, registryIndexItemURL } from './classification-policy.mjs';
+import { officialRegistryFrameworkProof } from './registry-framework-evidence.mjs';
+import { classificationFingerprint, CLASSIFICATION_POLICY, registryComponentIdentity, registryIndexItemURL } from './classification-policy.mjs';
 import { enrichCatalogueDetails } from './catalogue-details.mjs';
 import { publicPageMetadata } from './page-metadata.mjs';
 import { projectPublicArtifacts } from './public-artifacts.mjs';
 import { rawReadmeIdentity, repositoryReadmeRefs, verifyRawReadme } from './github-readme.mjs';
+import { GRAPHQL_SOURCE_URL, graphqlReadme, isPublicCensusSearch } from './github-graphql-source.mjs';
+import {PUBLIC_SOURCE_EXCERPT_VERSION} from './public-source-excerpt.mjs';
 
 export const PUBLIC_CATALOGUE_FORMAT = 'glasses-public-catalogue';
 export const PUBLIC_CATALOGUE_VERSION = 1;
-const MAX_BYTES = 32 * 1024 * 1024;
+const MAX_BYTES = 192 * 1024 * 1024;
 const sha = value => createHash('sha256').update(value).digest('hex');
 const canonical = value => JSON.stringify(normalize(value));
 function normalize(value) {
@@ -51,15 +54,19 @@ export const publicCatalogueSchema = z.object({
 }).strict();
 export const publicCatalogueJsonSchema = z.toJSONSchema(publicCatalogueSchema);
 function counts(items) { return { total:items.length,byKind:Object.fromEntries(['solution','component','pattern','reference'].map(kind=>[kind,items.filter(item=>item.kind===kind).length])),withStars:items.filter(item=>item.github?.stars!=null).length,withAssessment:items.filter(item=>item.assessment).length }; }
-function contentHash(items) { return sha(canonical({format:PUBLIC_CATALOGUE_FORMAT,formatVersion:1,items})); }
+function contentHash(items) {
+  const hash=createHash('sha256');hash.update('{"format":"glasses-public-catalogue","formatVersion":1,"items":[');
+  for(let index=0;index<items.length;index++){if(index)hash.update(',');hash.update(canonical(items[index]));}
+  return hash.update(']}').digest('hex');
+}
 function envelope(items, generatedAt) { const sorted=[...items].sort((a,b)=>a.id.localeCompare(b.id)); return {format:PUBLIC_CATALOGUE_FORMAT,formatVersion:1,generatedAt:date(generatedAt),contentHash:contentHash(sorted),capabilities:{portableInferenceCache:false,sourceBodies:false},counts:counts(sorted),items:sorted}; }
 
 // Enrichment takes an already validated public projection, never private local
 // capability fields. Exact retained source bodies are used only as evidence.
-export function enrichPublicCatalogue(input,{evidence=[],generatedAt=new Date().toISOString()}={}) {
+export function enrichPublicCatalogue(input,{evidence=[],readmeBindings=new Map(),generatedAt=new Date().toISOString()}={}) {
   const pack=validatePublicCatalogue(input);
   const artifacts=new Map(pack.items.filter(item=>item.license.scope==='source-artifact'&&item.citations.some(ref=>ref.kind==='github-artifact-document')).map(item=>[item.id,item]));
-  const rows=enrichCatalogueDetails({items:pack.items,evidence}).map(item=>artifacts.get(item.id)||item),members=new Map();
+  const rows=enrichCatalogueDetails({items:pack.items,evidence,readmeBindings}).map(item=>artifacts.get(item.id)||item),members=new Map();
   for(const row of rows)if(row.details?.parent)members.set(row.details.parent.id,(members.get(row.details.parent.id)||0)+1);
   for(const row of rows)if(members.has(row.id)||row.details?.memberCount!==undefined)row.details={...row.details,resourceType:'collection',memberCount:members.get(row.id)||0,citationIds:row.details?.citationIds||[row.citations[0].id]};
   return validatePublicCatalogue(envelope(rows,generatedAt));
@@ -72,7 +79,7 @@ export function withPublicCatalogueItems(input,items,{generatedAt=new Date().toI
 
 export function validatePublicCatalogue(input) {
   const serialized = typeof input === 'string' ? input : JSON.stringify(input);
-  if (Buffer.byteLength(serialized) > MAX_BYTES) throw new Error('Public catalogue exceeds 32 MiB');
+  if (Buffer.byteLength(serialized) > MAX_BYTES) throw new Error('Public catalogue exceeds 192 MiB');
   let value; try { value=typeof input==='string'?JSON.parse(input):input; } catch { throw new Error('Invalid public catalogue JSON'); }
   const result=publicCatalogueSchema.safeParse(value); if(!result.success)throw new Error('Invalid public catalogue schema');
   const pack=result.data, seen=new Set();
@@ -100,7 +107,37 @@ const tags = values => (Array.isArray(values)?values:[]).filter(value=>typeof va
 function repoURL(value){const url=publicLink(value);return url&&/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/?$/.test(url)?url.replace(/\/$/,''):null;}
 function verifiedSnapshot(snapshot) {
   if(!snapshot||typeof snapshot.body!=='string'||snapshot.body.length>16*1024*1024||sha(snapshot.body)!==snapshot.sha256||snapshot.id!==stableId(`${snapshot.url}\n${snapshot.sha256}`)||!date(snapshot.lastFetchedAt||snapshot.firstFetchedAt)||snapshot.status!==200)return null;
-  try{validatePublicURL(snapshot.url);let data=null;try{data=JSON.parse(snapshot.body);}catch{if(!/text\/html/i.test(snapshot.contentType||'')&&!rawReadmeIdentity(snapshot.url))return null;}return {...snapshot,data};}catch{return null;}
+  try{validatePublicURL(snapshot.url);let data=null;try{data=JSON.parse(snapshot.body);}catch{if(!/text\/html/i.test(snapshot.contentType||'')&&!rawReadmeIdentity(snapshot.url)&&!registryMarkdownItem(snapshot.url))return null;}return {...snapshot,data};}catch{return null;}
+}
+function registryMarkdownItem(url){
+  const prefix='https://registry.directory/api/markdown/';
+  return typeof url==='string'&&url.startsWith(prefix)?registryComponentIdentity('https://registry.directory/'+url.slice(prefix.length)):null;
+}
+// A saved label/sourceFiles array is not publication proof. Recompute from the
+// hash-verified response at the exact indexed provider/item endpoint only.
+function attachSourceFramework(projected,item,indexSnapshot,getSnapshot){
+  if(projected.citations[0].kind!=='registry-item-index')return;
+  const ref=item.sourceDocumentEvidence,source=ref?.id?getSnapshot(ref.id):null;
+  if(!source||ref.sha256!==source.sha256)return;
+  if(registryMarkdownItem(source.url)?.url!==projected.url){
+    const refs=item.registrySourceProof,directory=refs?.directory?.id?getSnapshot(refs.directory.id):null,registry=refs?.registry?.id?getSnapshot(refs.registry.id):null;
+    if(!directory||!registry||directory.sha256!==refs.directory.sha256||registry.sha256!==refs.registry.sha256)return;
+    const proof=officialRegistryFrameworkProof({itemUrl:projected.url,index:indexSnapshot,directory,registry,source});if(!proof)return;
+    const indexed=detectFramework({...proof.indexed,tags:proof.indexed.categories}),declared=detectFramework(proof.entry);
+    const result=detectFramework({...proof.data,frameworks:[...indexed.frameworks,...declared.frameworks,...(Array.isArray(proof.data.frameworks)?proof.data.frameworks:[])]});if(!result.frameworks.length)return;
+    projected.framework=result.framework;
+    projected.citations.push(citation(directory,projected.url,'registry-directory'),citation(registry,projected.url,'registry-item-index'),citation(source,projected.url,'registry-item-document'));
+    return;
+  }
+  const files=markdownSourceFiles(source.body);if(!files.length)return;
+  const dependencies=markdownDependencies(source.body,{...source,evidence:source});
+  const matches=indexSnapshot.data?.items?.filter(entry=>registryIndexItemURL(entry)===projected.url)||[];
+  if(matches.length!==1)return;
+  const indexed=detectFramework({...matches[0],tags:matches[0].categories});
+  const result=detectFramework({...dependencies,files,frameworks:indexed.frameworks});
+  if(!result.frameworks.length)return;
+  projected.framework=result.framework;
+  projected.citations.push(citation(source,projected.url,'registry-item-document'));
 }
 function projection(item,snapshot) {
   const source=new URL(snapshot.url),data=snapshot.data,url=publicLink(item.url);if(!url)return null;
@@ -114,7 +151,7 @@ function projection(item,snapshot) {
     fields={name:text(repo.full_name||repo.name,200),description:text(repo.description||'Public repository; inspect upstream for applicability.',1200),kind:recordKind,provider:'GitHub',tags:tags(repo.topics).slice(0,25),framework:detectFramework(repo).framework,license:rights(repo.license,'repository'),github:{stars,starsObservedAt:stars===null?null:date(snapshot.lastFetchedAt||snapshot.firstFetchedAt),archived:typeof repo.archived==='boolean'?repo.archived:null}};
     kind=source.pathname==='/search/repositories'?'github-search-metadata':'github-repository-metadata';
   }else if(source.href==='https://registry.directory/items.json'&&Array.isArray(data.items)){
-    const row=data.items.find(value=>value?.registry?.basePath&&/^\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(value.registry.basePath)&&`https://registry.directory${value.registry.basePath}/${encodeURIComponent(value.name)}`===url);if(!row)return null;
+    const row=data.items.find(value=>registryIndexItemURL(value)===url);if(!row)return null;
     fields={name:text(row.name,200),description:text(row.description||'Component indexed by registry.directory. Inspect source before use.',1200),kind:'component',provider:text(row.registry.name,200),tags:tags([...frameworkTags({...row,tags:row.categories}),...(row.categories||[]),...(row.type?[row.type]:[])]),framework:detectFramework({...row,tags:row.categories}).framework,license:rights(row.license,'registry-item'),github:null};kind='registry-item-index';
   }else if(source.href==='https://registry.directory/directory.json'&&Array.isArray(data.registries)){
     const row=data.registries.find(value=>publicLink(value?.url)===url);if(!row)return null;
@@ -129,9 +166,10 @@ function projection(item,snapshot) {
 }
 
 function retainedRefs(item){const repository=item.repositoryEvidence||[];return unique([...repositoryReadmeRefs(item),item.sourceDocumentEvidence?.id,item.metadataEvidence?.id,item.registryDocumentEvidence?.id,item.provenance?.sourceEvidenceId,item.licenseEvidence?.evidenceId,...repository.map(x=>x.id)].filter(Boolean));}
-export function publicCatalogueEvidenceIds(capabilities){return unique(capabilities.filter(item=>item.origin==='live'&&publicLink(item.url)).flatMap(item=>[item.metadataEvidence?.id,item.sourceDocumentEvidence?.id,item.repositoryReadmeProof?.apiEvidence?.id,...retainedRefs(item).slice(0,3),...(item.repositoryScopeEvidence||[]).map(ref=>ref.id),...(item.artifactEvidence||[]).map(ref=>ref.id)]).filter(id=>typeof id==='string'));}
+export function publicCatalogueEvidenceIds(capabilities){return unique(capabilities.filter(item=>item.origin==='live'&&publicLink(item.url)).flatMap(item=>[item.metadataEvidence?.id,item.sourceDocumentEvidence?.id,item.registrySourceProof?.directory?.id,item.registrySourceProof?.registry?.id,item.repositoryReadmeProof?.apiEvidence?.id,...retainedRefs(item).slice(0,3),...(item.repositoryScopeEvidence||[]).map(ref=>ref.id),...(item.artifactEvidence||[]).map(ref=>ref.id)]).filter(id=>typeof id==='string'));}
 function sourceSafe(snapshot,item,getSnapshot){
   if(!snapshot)return false;const url=new URL(snapshot.url);
+  if(snapshot.url===GRAPHQL_SOURCE_URL){try{const source=graphqlReadme(snapshot,item.graphqlReadmeProof),metadata=getSnapshot(item.metadataEvidence?.id)?.data,repo=(Array.isArray(metadata?.items)?metadata.items:[metadata]).find(row=>repoURL(row?.html_url)?.toLowerCase()===repoURL(item.url)?.toLowerCase());return repo?.id===source.repositoryId&&repo?.private===false&&repoURL(item.url)?.toLowerCase()===`https://github.com/${source.repository}`.toLowerCase()&&item.provenance?.resolvedRevision===source.revision;}catch{return false;}}
   if(rawReadmeIdentity(snapshot.url)){
     const proof=item.repositoryReadmeProof,repository=repoURL(item.url)?.slice('https://github.com/'.length),api=proof&&getSnapshot(proof.apiEvidence?.id);
     if(!repository||!proof||proof.rawEvidence?.id!==snapshot.id||proof.rawEvidence.sha256!==snapshot.sha256||!api||api.sha256!==proof.apiEvidence.sha256)return false;
@@ -140,7 +178,7 @@ function sourceSafe(snapshot,item,getSnapshot){
   if(url.hostname==='api.github.com'){
     // Search query text was visible to the original classifier and may be private.
     // Metadata remains exportable, but inferred free text must not echo that query.
-    if(url.pathname==='/search/repositories')return !url.search&&Array.isArray(snapshot.data?.items)&&snapshot.data.items.every(repo=>repo.private===false);
+    if(url.pathname==='/search/repositories')return (!url.search||isPublicCensusSearch(snapshot.url))&&Array.isArray(snapshot.data?.items)&&snapshot.data.items.every(repo=>repo.private===false);
     if(/^\/repositories\/[1-9]\d*$/.test(url.pathname))return !url.search&&snapshot.data?.private===false&&Number.isSafeInteger(snapshot.data.id)&&String(snapshot.data.id)===url.pathname.split('/').at(-1)&&repoURL(snapshot.data.html_url)?.toLowerCase()===repoURL(item.url)?.toLowerCase();
     if(!/^\/repos\/[^/]+\/[^/]+(?:\/(?:readme|license|commits\/[a-f0-9]{40}))?$/.test(url.pathname))return false;
     const prefix=new URL(item.url).pathname.replace(/^\//,'/repos/').toLowerCase();
@@ -149,17 +187,22 @@ function sourceSafe(snapshot,item,getSnapshot){
     return sameRepository&&[...url.searchParams.keys()].every(key=>key==='ref')&&(!url.search||/^[a-f0-9]{40}$/i.test(url.searchParams.get('ref')||''));
   }
   if(url.href==='https://registry.directory/items.json')return !!registryComponentIdentity(item.url)&&Array.isArray(snapshot.data?.items)&&snapshot.data.items.filter(entry=>registryIndexItemURL(entry)===item.url).length===1;
+  if(registryMarkdownItem(url.href)?.url===item.url)return true;
   return !url.search&&(url.href==='https://registry.directory/directory.json'||url.href===item.url&&Array.isArray(snapshot.data?.files));
 }
 function attachAssessment(projected,item,assessment,getSnapshot){
   if(!assessment||assessment.schemaVersion!==INTELLIGENCE_SCHEMA||!['codex','jev'].includes(assessment.provider)||assessment.model!==(assessment.provider==='codex'?'gpt-6-luna':'jev-1.13.0')||!date(assessment.updatedAt))return false;
+  // New publications must not silently reuse classifications made under an
+  // older rubric. Existing immutable packs retain their original wire format.
+  if(assessment.policyVersion!==CLASSIFICATION_POLICY)return false;
   // The producer must prove that the model's bounded metadata matches public upstream facts.
   const base={id:item.id,name:text(item.name,200),url:item.url,description:text(item.description,1200),provider:text(item.provider,100),sourceKind:item.kind,tags:tags(item.tags).slice(0,15)};
   const publicBase={id:projected.id,name:projected.name,url:projected.url,description:projected.description,provider:text(projected.provider,100),sourceKind:projected.kind,tags:projected.tags.slice(0,15)};
   if(canonical(base)!==canonical(publicBase))return false;
   // The shared helper also binds registry components to the exact-URL excerpt
   // selection version. Old same-name matches cannot become public labels.
-  const refs=retainedRefs(item),fingerprint=classificationFingerprint({base,evidenceIds:refs,revision:item.provenance?.resolvedRevision||item.provenance?.revision||null,sourceHash:item.provenance?.sourceHash||null,policy:assessment.policyVersion||LEGACY_CLASSIFICATION_POLICY});
+  const refs=retainedRefs(item),repositorySourceSelection=repositoryReadmeRefs(item).length?PUBLIC_SOURCE_EXCERPT_VERSION:null;
+  const fingerprint=classificationFingerprint({base,evidenceIds:refs,revision:item.provenance?.resolvedRevision||item.provenance?.revision||null,sourceHash:item.provenance?.sourceHash||null,policy:CLASSIFICATION_POLICY,repositorySourceSelection});
   if(assessment.sourceFingerprint!==fingerprint)return false;
   const used=refs.slice(0,3).map(getSnapshot);if(!used.length||used.some(snapshot=>!sourceSafe(snapshot,item,getSnapshot)))return false;
   const classification=assessment.classification;if(!classification||!Array.isArray(classification.evidenceIds)||!classification.evidenceIds.length||classification.evidenceIds.some(id=>!used.some(snapshot=>snapshot.id===id)))return false;
@@ -183,6 +226,7 @@ export function createPublicCatalogue({capabilities,evidence,assessments=[],gene
     if(!snapshot||item.metadataEvidence?.sha256&&item.metadataEvidence.sha256!==snapshot.sha256){excluded.unsupportedEvidence++;continue;}
     let projected;try{projected=projection(item,snapshot);}catch{projected=null;}
     if(!projected){excluded.unsupportedEvidence++;continue;}
+    attachSourceFramework(projected,item,snapshot,getSnapshot);
     if(!itemSchema.safeParse(projected).success){excluded.unsafeMetadata++;continue;}
     const assessment=assessmentById.get(item.id);
     if(assessment){let accepted=false;try{accepted=attachAssessment(projected,item,assessment,getSnapshot);}catch{}if(!accepted)report.assessmentOmitted++;}

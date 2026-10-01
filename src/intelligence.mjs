@@ -5,13 +5,15 @@ import { validatePublicURL } from './discovery.mjs';
 import { measureJevClassificationBatch, isDefinitelyUnsentProviderError, ARTIFACTS, ADOPTIONS } from './providers.mjs';
 import { CLASSIFICATION_SCHEMA, CLASSIFICATION_POLICY, LEGACY_CLASSIFICATION_POLICY, classificationFingerprint, registryComponentIdentity, registryIndexItemURL } from './classification-policy.mjs';
 import { repositoryReadmeRefs } from './github-readme.mjs';
+import { GRAPHQL_SOURCE_URL, graphqlReadme } from './github-graphql-source.mjs';
+import {PUBLIC_SOURCE_EXCERPT_VERSION,selectPublicSourceExcerpt} from './public-source-excerpt.mjs';
 import { purposeAnchor, purposeEvidence } from './purpose-matching.mjs';
-import { detectFramework } from './framework.mjs';
+import {searchConstraints,sourceConstraintFacts,constraintFit,constraintWeight,constraintPriority} from './search-constraints.mjs';
 
 export { ARTIFACTS, ADOPTIONS } from './providers.mjs';
 export const INTELLIGENCE_SCHEMA=CLASSIFICATION_SCHEMA;
 export const INTELLIGENCE_POLICY=CLASSIFICATION_POLICY;
-export const DEFAULT_INTELLIGENCE_SETTINGS={provider:'codex',autoClassify:false,autoResearch:false,maxCandidates:10,maxJobsPerDay:4,timeoutSeconds:180,jevDailyBudgetUsd:0.10,confidenceThreshold:0.65};
+export const DEFAULT_INTELLIGENCE_SETTINGS={provider:'codex',autoClassify:false,autoResearch:false,maxCandidates:10,maxJobsPerDay:4,timeoutSeconds:180,jevDailyBudgetUsd:0.10,jevConcurrency:1,confidenceThreshold:0.65};
 const now=()=>new Date().toISOString(), hash=value=>createHash('sha256').update(typeof value==='string'?value:JSON.stringify(value)).digest('hex');
 const fail=(message,status=400)=>Object.assign(new Error(message),{status});
 const unique=values=>[...new Set(values)];
@@ -28,6 +30,8 @@ function comparePopularity(a,b) {
 function stringArray(value,name,maxItems=20,maxLength=100){if(!Array.isArray(value)||value.length>maxItems||value.some(x=>typeof x!=='string'||!x.trim()||x.length>maxLength))throw fail(`${name} must contain at most ${maxItems} non-empty strings of at most ${maxLength} characters`);return unique(value.map(x=>x.trim()));}
 function publicURL(value){try{return validatePublicURL(value).href;}catch{return null;}}
 function excerpt(snapshot,item,parsedCache){
+  const selected=value=>{try{return selectPublicSourceExcerpt(value).text;}catch{return '';}};
+  if(snapshot.url===GRAPHQL_SOURCE_URL){try{const source=graphqlReadme(snapshot,item.graphqlReadmeProof);return item.url.toLowerCase()===`https://github.com/${source.repository}`.toLowerCase()&&item.provenance?.resolvedRevision===source.revision?selected(source.text):'';}catch{return '';}}
   let value=snapshot.body;const registryIndex=snapshot.url==='https://registry.directory/items.json';
   try {
     let data=parsedCache.get(snapshot.id);if(data===undefined){data=JSON.parse(value);parsedCache.set(snapshot.id,data);}
@@ -45,14 +49,14 @@ function excerpt(snapshot,item,parsedCache){
       value=selected?JSON.stringify(selected):value;
     }
   }catch{if(registryIndex)return '';}
-  return text(value,2000);
+  return repositoryReadmeRefs(item).includes(snapshot.id)?selected(value):text(value,2000);
 }
 
 export function createIntelligence({store,discovery,providers,dataDir=store.directory}) {
   if(!providers?.classify||!providers?.plan||!providers?.rank)throw new Error('Intelligence providers must implement classify, plan and rank');
   const db=createIntelligenceStore(dataDir);
   let settings={...DEFAULT_INTELLIGENCE_SETTINGS,...(db.get('settings','current')?.value||{})};
-  let closed=false,running=null,pumpPromise=null;
+  let closed=false,running=null,pumpPromise=null,nextJevRequestAt=0;
   // Synchronous discovery hooks can use models already observed by this engine
   // without spawning a status probe or changing their public return contract.
   const observedModels=Object.assign({},...db.all('jobs').sort((a,b)=>(a.createdAt||'').localeCompare(b.createdAt||'')).map(job=>job.providerModels||{}));
@@ -61,21 +65,22 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
   const checkAbort=signal=>{if(signal?.aborted)throw signal.reason||new Error('Job cancelled');};
   const getSettings=()=>({...settings});
   const usageToday=()=>{
-    const day=now().slice(0,10),rows=db.all('usage').filter(row=>row.createdAt.startsWith(day));
-    return {day,timeZone:'UTC',jobs:db.all('jobs').filter(job=>job.createdAt.startsWith(day)).length,calls:rows.filter(row=>row.requestSent!==false).length,localRejections:rows.filter(row=>row.requestSent===false).length,inputTokens:rows.reduce((n,row)=>n+(row.inputTokens||0),0),outputTokens:rows.reduce((n,row)=>n+(row.outputTokens||0),0),jevCostUsd:rows.filter(row=>row.provider==='jev').reduce((n,row)=>n+(row.costUsd??0),0),jevReservedUsd:rows.filter(row=>row.provider==='jev').reduce((n,row)=>n+(row.chargedOrReservedUsd||0),0),unknownCostCalls:rows.filter(row=>row.costUsd==null).length,note:'Codex subscription usage is not converted to API prices. Unreported Jev costs retain a conservative per-call reservation; verified local rejections consume no inference budget.'};
+    const day=now().slice(0,10);
+    return {day,timeZone:'UTC',...db.usageSummary(day),note:'Codex subscription usage is not converted to API prices. Unreported Jev costs retain a conservative per-call reservation; verified local rejections consume no inference budget.'};
   };
-  function cardFor(id,{hydrate=true,snapshots=new Map(),parsed=new Map()}={}) {
-    const item=store.getCapability(id);if(!item)return null;
+  function cardFor(id,{hydrate=true,snapshots=new Map(),parsed=new Map(),item:knownItem}={}) {
+    const item=knownItem??store.getCapabilitySummary(id);if(!item)return null;
     if(item.origin!=='live'||!publicURL(item.url))return null;
     const repositoryEvidence=item.repositoryEvidence||[];
     const refs=unique([...repositoryReadmeRefs(item),item.sourceDocumentEvidence?.id,item.metadataEvidence?.id,item.registryDocumentEvidence?.id,item.provenance?.sourceEvidenceId,item.licenseEvidence?.evidenceId,...repositoryEvidence.map(x=>x.id)].filter(Boolean));
     const base={id:item.id,name:text(item.name,200),url:item.url,description:text(item.description,1200),provider:text(item.provider,100),sourceKind:item.kind,tags:(item.tags||[]).filter(x=>typeof x==='string').slice(0,15)};
     // Evidence IDs already bind URL + content hash. Catalogue staleness checks
     // must never parse the original multi-megabyte registry body per record.
-    const sourceFingerprint=classificationFingerprint({base,evidenceIds:refs,revision:item.provenance?.resolvedRevision||item.provenance?.revision||null,sourceHash:item.provenance?.sourceHash||null});
-    if(!hydrate)return {...base,evidenceIds:refs,sourceFingerprint};
+    const repositorySourceSelection=repositoryReadmeRefs(item).length?PUBLIC_SOURCE_EXCERPT_VERSION:null;
+    const sourceFingerprint=classificationFingerprint({base,evidenceIds:refs,revision:item.provenance?.resolvedRevision||item.provenance?.revision||null,sourceHash:item.provenance?.sourceHash||null,repositorySourceSelection});
+    if(!hydrate)return {...base,evidenceIds:refs,sourceFingerprint,repositorySourceSelection};
     const evidence=refs.slice(0,3).map(id=>{if(!snapshots.has(id))snapshots.set(id,store.getEvidence(id));return snapshots.get(id);}).filter(snapshot=>snapshot&&publicURL(snapshot.url)).map(snapshot=>({id:snapshot.id,sha256:snapshot.sha256,url:snapshot.url,excerpt:excerpt(snapshot,item,parsed)}));
-    return {...base,evidenceIds:evidence.map(x=>x.id),evidence,sourceFingerprint};
+    return {...base,evidenceIds:evidence.map(x=>x.id),evidence,sourceFingerprint,repositorySourceSelection};
   }
   function validateAssessment(input,card,{partial=false}={}) {
     if(!input||typeof input!=='object'||Array.isArray(input))throw fail('Assessment must be an object');
@@ -93,9 +98,9 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
     }
     return result;
   }
-  function assessment(id) {
-    if(!store.getCapability(id))return null;
-    const classified=db.get('assessments',id),correction=db.get('corrections',id),card=cardFor(id,{hydrate:false});
+  function assessment(id,knownItem,records) {
+    const item=knownItem??store.getCapabilitySummary(id);if(!item)return null;
+    const classified=records?records.assessments.get(id):db.get('assessments',id),correction=records?records.corrections.get(id):db.get('corrections',id),card=cardFor(id,{hydrate:false,item});
     const stale=!!classified&&(classified.policyVersion!==INTELLIGENCE_POLICY||classified.sourceFingerprint!==card?.sourceFingerprint);
     const values={artifact:'unknown',adoption:'unknown',capabilities:[],confidence:null,evidenceIds:[],...(classified?.classification||{}),...(correction?.patch||{})};
     return {capabilityId:id,...values,status:stale?'stale':correction?'corrected':!classified?'unclassified':values.confidence>=settings.confidenceThreshold&&values.artifact!=='unknown'?'classified':'needs-review',stale,humanCorrected:!!correction,provider:classified?.provider||null,model:classified?.model||null,updatedAt:correction?.updatedAt||classified?.updatedAt||null,classification:classified?.classification||null,correction:correction?.patch||null,sourceFingerprint:classified?.sourceFingerprint||null,currentFingerprint:card?.sourceFingerprint||null,schemaVersion:INTELLIGENCE_SCHEMA,policyVersion:classified?(classified.policyVersion||LEGACY_CLASSIFICATION_POLICY):null,currentPolicyVersion:INTELLIGENCE_POLICY};
@@ -104,18 +109,23 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
     const validated=validateAssessment(classification,card);
     const previous=db.get('assessments',card.id);
     if(previous?.provider===provider&&previous?.model===model&&previous?.policyVersion===INTELLIGENCE_POLICY&&previous?.sourceFingerprint===card.sourceFingerprint&&JSON.stringify(previous.classification)===JSON.stringify(validated))return assessment(card.id);
-    db.save('assessments',{id:card.id,classification:validated,provider,model,jobId,sourceFingerprint:card.sourceFingerprint,schemaVersion:INTELLIGENCE_SCHEMA,policyVersion:INTELLIGENCE_POLICY,updatedAt:now()});
+    db.save('assessments',{id:card.id,classification:validated,provider,model,jobId,sourceFingerprint:card.sourceFingerprint,repositorySourceSelection:card.repositorySourceSelection,schemaVersion:INTELLIGENCE_SCHEMA,policyVersion:INTELLIGENCE_POLICY,updatedAt:now()});
     return assessment(card.id);
   }
   function decorate(items,{query='',artifact}={}) {
     boundedText(query,'query',500);if(artifact&&artifact!=='all'&&!ARTIFACTS.includes(artifact))throw fail('Invalid artifact filter');
+    // Each catalogue request gets fresh model/correction rows in two reads,
+    // rather than two prepared primary-key lookups for every candidate. Keep
+    // this request-scoped so commits from other local processes remain visible.
+    const records=items.length?{assessments:new Map(db.all('assessments').map(row=>[row.id,row])),corrections:new Map(db.all('corrections').map(row=>[row.id,row]))}:null;
     const terms=searchTerms(query),anchor=purposeAnchor(query),exactQuery=query.normalize('NFKC').trim().toLowerCase();
-    const positiveFrameworkQuery=exactQuery.replace(/\b(?:without|excluding|except|not|no)\s+([^,;.!?]+)/g,(_whole,tail)=>tail.split(/\b(?:but|and|while|with|for|that|which)\b/).slice(1).join(' '));
-    const requestedFrameworks=detectFramework({frameworks:positiveFrameworkQuery.match(/\b(?:react(?:js|\.js)?|vue(?:js|\.js|[23])?|svelte(?:js)?|angular|solid(?:js|\.js)?|preact)\b/gi)||[]}).frameworks;
+    const constraints=searchConstraints(query);
     const outcomeText=new Map();
     if(terms.length)for(const outcome of store.outcomes())outcomeText.set(outcome.capabilityId,`${outcomeText.get(outcome.capabilityId)||''} ${outcome.result||''} ${outcome.notes||''} ${Object.values(outcome.context||{}).join(' ')}`.toLowerCase());
     return items.map(item=>{
-      const info=assessment(item.id),inferred=[info?.artifact,info?.adoption,...(info?.capabilities||[])].join(' ').toLowerCase();
+      // Search already supplied the current capability. Reuse that snapshot
+      // rather than reparsing the same database JSON twice for every result.
+      const info=assessment(item.id,item,records),inferred=[info?.artifact,info?.adoption,...(info?.capabilities||[])].join(' ').toLowerCase();
       const shared=item.origin==='shared'&&item.sharedAssessment?[item.sharedAssessment.artifact,item.sharedAssessment.adoption,...(item.sharedAssessment.capabilities||[])].join(' ').toLowerCase():'';
       const fields={name:text(item.name).toLowerCase(),tags:(item.tags||[]).join(' ').toLowerCase(),description:text(item.description,4000).toLowerCase(),provider:text(item.provider).toLowerCase(),kind:item.kind,framework:text(item.framework).toLowerCase(),outcomes:outcomeText.get(item.id)||'',inferred,sharedInferred:shared,sourceDetails:[item.details?.overview,...item.details?.features||[],...item.details?.keywords||[],...(item.details?.sections||[]).map(section=>section.title+' '+section.summary)].filter(Boolean).join(' ').toLowerCase()};
       const matches=terms.filter(term=>Object.values(fields).some(value=>String(value).includes(term)));
@@ -127,18 +137,18 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
       score*=0.3+0.7*coverage*coverage;
       const exact=exactQuery&&(fields.name===exactQuery||text(item.url,4000).toLowerCase()===exactQuery||item.id===exactQuery),purpose=purposeEvidence(anchor,fields);
       if(anchor&&!exact)score=score*purpose.weight+purpose.bonus;
-      let frameworkExcluded=false;
-      if(requestedFrameworks.length&&item.kind==='component'&&!exact){
+      let frameworkExcluded=false,constraintRank=0;
+      if(item.kind==='component'&&!exact){
         // Only declared/source facts identify a framework. Inferred labels and
         // JSX syntax do not, and whole tools retain their existing behaviour.
-        const sourceFrameworks=detectFramework({framework:item.framework,frameworks:text(item.framework).split(/\s*[/,|]\s*/),tags:item.tags,description:item.description,dependencies:item.details?.dependencies}).frameworks;
-        frameworkExcluded=sourceFrameworks.length>0&&!sourceFrameworks.some(name=>requestedFrameworks.includes(name));
-        if(!sourceFrameworks.length)score*=.65;
-        else if(!frameworkExcluded)score+=3*sourceFrameworks.filter(name=>requestedFrameworks.includes(name)).length;
+        const fit=constraintFit(constraints,sourceConstraintFacts(item));
+        frameworkExcluded=fit.framework==='different';
+        score*=constraintWeight(fit);
+        constraintRank=constraintPriority(fit);
       }
       if(exact)score+=500;
-      return {...item,assessment:info,matchReason:terms.length?`Text matched: ${matches.join(', ')} (${matches.length}/${terms.length} terms), including inferred labels and local outcome context${matches.some(term=>shared.includes(term))?'; attributed shared labels are not locally verified':''}${anchor?`; ${anchor} purpose: ${purpose.level}`:''}. Classification is not verified compatibility.`:item.matchReason,_matches:frameworkExcluded?0:matches.length||Number(purpose.matched)||Number(exact),_score:score};
-    }).filter(item=>(!terms.length||item._matches)&&(!artifact||artifact==='all'||item.assessment?.artifact===artifact)).sort((a,b)=>b._score-a._score||comparePopularity(a,b)).map(({_matches,_score,...item})=>item);
+      return {...item,assessment:info,matchReason:terms.length?`Text matched: ${matches.join(', ')} (${matches.length}/${terms.length} terms), including inferred labels and local outcome context${matches.some(term=>shared.includes(term))?'; attributed shared labels are not locally verified':''}${anchor?`; ${anchor} purpose: ${purpose.level}`:''}. Classification is not verified compatibility.`:item.matchReason,_matches:frameworkExcluded?0:matches.length||Number(purpose.matched)||Number(exact),_score:score,_constraintRank:constraintRank,_exact:Number(Boolean(exact))};
+    }).filter(item=>(!terms.length||item._matches)&&(!artifact||artifact==='all'||item.assessment?.artifact===artifact)).sort((a,b)=>b._exact-a._exact||b._constraintRank-a._constraintRank||b._score-a._score||comparePopularity(a,b)).map(({_matches,_score,_constraintRank,_exact,...item})=>item);
   }
   async function providerState(){const state=await providers.status?.()||{};for(const provider of ['codex','jev'])if(state[provider]?.model)observedModels[provider]=state[provider].model;return state;}
   function needsClassification(card,provider,model) {
@@ -147,7 +157,9 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
   }
   function selectCandidates(ids,query,limit,{classification=false,provider=settings.provider,model=observedModels[provider],pendingOnly=false,cardCache={snapshots:new Map(),parsed:new Map()}}={}) {
     const scope=ids?new Set(ids):null;
-    const eligible=store.search({query:''}).filter(item=>item.origin==='live'&&(!scope||scope.has(item.id)));
+    // An explicit bounded MCP batch must not parse and decorate the entire
+    // catalogue. Keep the same eligibility and ordering within its membership.
+    const eligible=(scope?[...scope].map(id=>store.getCapabilitySummary(id)).filter(Boolean):store.search({query:''})).filter(item=>item.origin==='live');
     const matching=decorate(eligible,{query});
     const matchedIds=new Set(matching.map(item=>item.id)),remaining=eligible.filter(item=>!matchedIds.has(item.id)).sort(comparePopularity);
     const groups=classification?[[],[],[],[]]:[matching,remaining];
@@ -183,10 +195,18 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
     checkAbort(signal);
     const state=await providerState();checkAbort(signal);
     if(state[provider]?.configured===false)throw new Error(`${provider} is not configured; connect it before running intelligence`);
+    // One engine owns all reservations. Pace starts even when classification
+    // uses several in-flight requests; a cancelled wait has sent no request.
+    if(provider==='jev'&&job.settingsSnapshot.jevConcurrency>1){
+      const at=Math.max(Date.now(),nextJevRequestAt);nextJevRequestAt=at+400;
+      if(at>Date.now())await withAbort(new Promise(resolve=>setTimeout(resolve,at-Date.now())),signal);
+      checkAbort(signal);
+    }
     const usage=usageToday();
     if(provider==='jev'&&state.jev?.model!=='jev-1.13.0')throw new Error('Jev budget requires the reviewed pinned model jev-1.13.0');
     if(provider==='jev'&&usage.jevReservedUsd+JEV_MAX_CALL_USD>Math.min(settings.jevDailyBudgetUsd,job.settingsSnapshot.jevDailyBudgetUsd)+1e-12)throw fail('Jev daily budget would be exceeded; adjust the cap or wait for the next UTC day',429);
     const receipt={id:randomUUID(),jobId:job.id,provider,operation,createdAt:now(),status:'running',costUsd:null,chargedOrReservedUsd:provider==='jev'?JEV_MAX_CALL_USD:0};
+    if(provider==='jev'&&operation==='classify')receipt.request={candidateIds:payload.cards.map(card=>card.id),...measureJevClassificationBatch(payload.cards)};
     db.save('usage',receipt);
     let response;
     try {
@@ -202,6 +222,11 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
       return response;
     }catch(error){
       receipt.status=signal.aborted?'cancelled':'failed';receipt.error=text(error.message,1000);
+      // Public diagnostics distinguish an explicit HTTP rejection from an
+      // uncertain transport failure. Both keep their conservative reservation.
+      if(/^JEV_HTTP_[1-5]\d\d$/.test(error.code||''))receipt.providerHttpStatus=Number(error.code.slice(-3));
+      if(['question-limit','context-limit','account-quota','text-encoding','request-validation','unrecognized-response'].includes(error.diagnostics?.reason))receipt.providerReason=error.diagnostics.reason;
+      if(Number.isFinite(error.retryAfterSeconds)&&error.retryAfterSeconds>=0&&error.retryAfterSeconds<=3600)receipt.retryAfterSeconds=error.retryAfterSeconds;
       if(isDefinitelyUnsentProviderError(error))Object.assign(receipt,{requestSent:false,costUsd:0,chargedOrReservedUsd:0,inputTokens:0,outputTokens:0});
       throw error;
     }
@@ -222,11 +247,11 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
     if(automatic&&!ids.length)job.result.noPendingWork=true;
     saveJob(job);
     if(job.type==='research'&&discovery.inspect){
-      const enrich=ids.map(id=>store.getCapability(id)).filter(item=>item?.kind==='solution'&&/^https:\/\/github\.com\/[^/]+\/[^/]+\/?$/.test(item.url)&&!(item.repositoryEvidence||[]).some(evidence=>/\/readme(?:\?|$)/i.test(evidence.url||''))).slice(0,3);
+      const enrich=ids.map(id=>store.getCapability(id)).filter(item=>item?.kind==='solution'&&/^https:\/\/github\.com\/[^/]+\/[^/]+\/?$/.test(item.url)&&!repositoryReadmeRefs(item).length).slice(0,3);
       job.result.enrichedCandidateIds=[];
       for(const item of enrich){
         checkAbort(signal);job.stage='enriching-source';saveJob(job);
-        try{const inspected=await discovery.inspect(item.id,{fetchSource:true,signal});checkAbort(signal);if(inspected?.sourceError)job.errors.push(`${item.id}: source enrichment: ${inspected.sourceError}`);if(inspected?.repositoryEvidence?.some(evidence=>/\/readme(?:\?|$)/i.test(evidence.url||'')))job.result.enrichedCandidateIds.push(item.id);}
+        try{const inspected=await discovery.inspect(item.id,{fetchSource:true,signal});checkAbort(signal);if(inspected?.sourceError)job.errors.push(`${item.id}: source enrichment: ${inspected.sourceError}`);if(repositoryReadmeRefs(inspected||{}).length)job.result.enrichedCandidateIds.push(item.id);}
         catch(error){checkAbort(signal);job.errors.push(`${item.id}: source enrichment: ${error.message}`);}
       }
     }
@@ -251,7 +276,10 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
       nextBatch.push(card);
     }
     if(nextBatch.length)batches.push(nextBatch);
-    for(const batch of batches){
+    let nextBatchIndex=0,workerFailure=null;
+    async function classifyWorker(){while(nextBatchIndex<batches.length&&!workerFailure){
+      const batch=batches[nextBatchIndex++];
+      try{
       checkAbort(signal);job.stage='classifying';saveJob(job);
       const response=await callProvider(job,job.provider,'classify',{cards:batch},signal);
       if(!Array.isArray(response.results))throw new Error('Classifier did not return a results array');
@@ -268,7 +296,13 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
       }
       for(const card of batch)if(!seen.has(card.id))job.errors.push(`${card.id}: classifier omitted this candidate`);
       saveJob(job);
-    }
+      }catch(error){workerFailure ||= error;}
+    }}
+    const concurrency=job.provider==='jev'?Math.min(settings.jevConcurrency,job.settingsSnapshot.jevConcurrency||1):1;
+    // Await every already-started request so failed/aborted jobs retain complete
+    // usage before reporting terminal state. Never retry uncertain paid calls.
+    await Promise.all(Array.from({length:Math.min(concurrency,batches.length)},classifyWorker));
+    if(workerFailure)throw workerFailure;
     job.result.assessmentIds=unique(job.result.assessmentIds);
   }
   async function rank(job,signal) {
@@ -324,7 +358,7 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
   }
   function pump(){
     if(closed||pumpPromise)return;
-    pumpPromise=Promise.resolve().then(async()=>{while(!closed){const job=db.all('jobs').filter(job=>job.status==='queued').sort((a,b)=>a.createdAt.localeCompare(b.createdAt)||a.id.localeCompare(b.id))[0];if(!job)break;await runJob(job);}}).finally(()=>{pumpPromise=null;});
+    pumpPromise=Promise.resolve().then(async()=>{while(!closed){const job=db.nextQueuedJob();if(!job)break;await runJob(job);}}).finally(()=>{pumpPromise=null;});
   }
   function enqueue(input={},selection={}) {
     if(closed)throw fail('Intelligence engine is closed',503);
@@ -343,7 +377,7 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
     if(candidateIds)for(const id of candidateIds)if(!store.getCapability(id))throw fail(`Capability not found: ${id}`,404);
     if(!candidateIds)candidateIds=input.type==='research'?[]:selectCandidates(null,query,input.type==='rank'?30:settings.maxCandidates,{classification:input.type==='classify',provider});
     if(input.type!=='research'&&!candidateIds.length)throw fail('No catalogue candidates available for this job');
-    if(db.all('jobs').filter(job=>['queued','running'].includes(job.status)).length>=MAX_QUEUE)throw fail('Intelligence queue is full',429);
+    const counts=db.jobCounts();if(counts.queued+counts.running>=MAX_QUEUE)throw fail('Intelligence queue is full',429);
     if(usageToday().jobs>=settings.maxJobsPerDay)throw fail('Daily intelligence job limit reached; adjust the cap or wait for the next UTC day',429);
     const job={id:randomUUID(),type:input.type,status:'queued',provider,query,planId:plan?.id||null,planSnapshot:plan?structuredClone(plan):null,trigger,createdAt:now(),startedAt:null,finishedAt:null,stage:'queued',candidateIds,selectionMode,...(selectionMode!=='explicit'?{initialCandidateIds:[...candidateIds]}:{}),...(selection.scopeIds?{selectionScopeIds:[...selection.scopeIds]}:{}),runIds:[],errors:[],usage:[],result:{},settingsSnapshot:getSettings()};
     const saved=saveJob(job);pump();return saved;
@@ -355,12 +389,12 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
       for(const key of Object.keys(patch))if(!(key in DEFAULT_INTELLIGENCE_SETTINGS))throw fail(`Unknown intelligence setting: ${key}`);
       const next={...settings,...patch};if(!['codex','jev'].includes(next.provider))throw fail('provider must be codex or jev');
       for(const key of ['autoClassify','autoResearch'])if(typeof next[key]!=='boolean')throw fail(`${key} must be boolean`);
-      for(const [key,min,max] of [['maxCandidates',1,30],['maxJobsPerDay',1,500],['timeoutSeconds',1,600]])if(!Number.isInteger(next[key])||next[key]<min||next[key]>max)throw fail(`${key} must be an integer between ${min} and ${max}`);
+      for(const [key,min,max] of [['maxCandidates',1,30],['maxJobsPerDay',1,5000],['timeoutSeconds',1,600],['jevConcurrency',1,4]])if(!Number.isInteger(next[key])||next[key]<min||next[key]>max)throw fail(`${key} must be an integer between ${min} and ${max}`);
       for(const [key,max] of [['jevDailyBudgetUsd',100],['confidenceThreshold',1]])if(!Number.isFinite(next[key])||next[key]<0||next[key]>max)throw fail(`${key} must be between 0 and ${max}`);
       settings=next;db.save('settings',{id:'current',value:settings});return getSettings();
     },
-    async status(){const jobs=db.all('jobs');return {settings:getSettings(),providers:await providerState(),runningJobId:running?.job.id||null,counts:Object.fromEntries(['queued','running','completed','partial','failed','cancelled','interrupted'].map(status=>[status,jobs.filter(job=>job.status===status).length])),usageToday:usageToday(),limits:{maxQueue:MAX_QUEUE,concurrency:1,jevMaximumCallReservationUsd:JEV_MAX_CALL_USD}};},
-    listJobs({limit=50,offset=0}={}){if(!Number.isInteger(limit)||limit<1||limit>100||!Number.isInteger(offset)||offset<0)throw fail('Invalid job pagination');const jobs=db.all('jobs').sort((a,b)=>b.createdAt.localeCompare(a.createdAt)||b.id.localeCompare(a.id));return {items:jobs.slice(offset,offset+limit),total:jobs.length};},
+    async status(){return {settings:getSettings(),providers:await providerState(),runningJobId:running?.job.id||null,counts:db.jobCounts(),usageToday:usageToday(),limits:{maxQueue:MAX_QUEUE,concurrency:1,jevRequestConcurrency:settings.jevConcurrency,jevMaximumCallReservationUsd:JEV_MAX_CALL_USD}};},
+    listJobs({limit=50,offset=0}={}){if(!Number.isInteger(limit)||limit<1||limit>100||!Number.isInteger(offset)||offset<0)throw fail('Invalid job pagination');return db.listJobs({limit,offset});},
     getJob:id=>db.get('jobs',id),enqueue,
     cancel(id){const job=db.get('jobs',id);if(!job)return null;if(['queued','running'].includes(job.status)){job.status='cancelled';job.stage='cancelled';job.finishedAt=now();job.errors.push('Cancelled by user');saveJob(job);if(running?.job.id===id){running.job.errors.push('Cancelled by user');running.controller.abort(new Error('Cancelled by user'));}}return db.get('jobs',id);},
     afterDiscovery(run){
@@ -373,7 +407,7 @@ export function createIntelligence({store,discovery,providers,dataDir=store.dire
       if(!ids.length)return null;
       return associate(enqueue({type:'classify',query:run.query||'',candidateIds:ids,trigger:'scheduled'},{mode:'discovery',scopeIds:run.candidateIds}));
     },
-    decorate,getAssessment:assessment,
+    decorate,getAssessment:id=>assessment(id),
     correctAssessment(id,patch){if(!store.getCapability(id))throw fail('Capability not found',404);const fields=validateAssessment(patch,null,{partial:true}),previous=db.get('corrections',id);db.save('corrections',{id,patch:{...(previous?.patch||{}),...fields},createdAt:previous?.createdAt||now(),updatedAt:now()});return assessment(id);},
     submitAssessment(id,input){const card=cardFor(id);if(!card)throw fail('Public capability not found',404);return persistAssessment(card,input,{provider:'agent',model:'calling-agent'});},
     async close(){closed=true;if(running)running.controller.abort(new Error('Intelligence engine is closing'));if(pumpPromise)await pumpPromise;db.close();}

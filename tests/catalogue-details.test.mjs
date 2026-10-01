@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {enrichCatalogueDetails} from '../src/catalogue-details.mjs';
+import {publicCatalogueSchema} from '../src/public-catalogue.mjs';
 
 const at='2026-09-30T00:00:00.000Z',revision='a'.repeat(40);
 const hash=value=>createHash('sha256').update(value).digest('hex'),id=value=>hash(value).slice(0,20);
@@ -24,6 +25,23 @@ function collection(){
   return{directory,index,parent,child,items:[parent,child('accordion'),child('counter'),item('https://registry.directory/other-owner/friendly-ui/foreign','foreign',index,'component')]};
 }
 const readme=(repo,body,overrides={})=>source(`https://api.github.com/repos/${repo}/readme?ref=${revision}`,{encoding:'base64',path:'README.md',content:Buffer.from(body).toString('base64')},overrides);
+
+test('README documentation links canonicalize empty delimiters without weakening strict URL validation',()=>{
+  const repo='public-lab/arrays',metadata=source('https://api.github.com/repos/'+repo,{private:false}),row=item('https://github.com/'+repo,'Arrays',metadata);
+  const target='https://docs.example.org/build/html/install.html';
+  for(const suffix of ['', '#', '?', '?#']){
+    const retained=readme(repo,`# Arrays\nA public array framework for numerical computation.\n[Documentation](${target}${suffix})`);
+    const [result]=enrichCatalogueDetails({items:[row],evidence:[retained]});
+    assert.equal(result.details.documentationUrl,target);assert.equal(result.id,row.id);assert.equal(result.description,row.description);
+    assert.match(result.details.overview,/public array framework/);assert(result.details.citationIds.some(ref=>result.citations.find(c=>c.id===ref)?.sha256===retained.sha256));
+    assert.equal(publicCatalogueSchema.shape.items.element.safeParse(result).success,true);
+  }
+  for(const url of [target+'#setup',target+'?token=value','https://user:password@docs.example.org/','https://docs.internal/','https://docs.example.org/'+ '文'.repeat(1000)]){
+    const [result]=enrichCatalogueDetails({items:[row],evidence:[readme(repo,`# Arrays\nA public array framework for numerical computation.\n[Documentation](${url})`)]});
+    assert.equal(result.details.documentationUrl,undefined);assert.match(result.details.overview,/public array framework/);assert.equal(result.id,row.id);
+    assert.equal(publicCatalogueSchema.shape.items.element.safeParse(result).success,true);
+  }
+});
 
 test('exact retained directory/repository relationship links published children and counts only those members',()=>{
   const data=collection(),before=JSON.stringify(data),result=enrichCatalogueDetails({items:data.items,evidence:[data.directory,data.index]});
@@ -240,6 +258,79 @@ function docsScopeFixture(){
   const tree=source(`https://api.github.com/repos/${repo}/git/trees/${treeSha}?recursive=1`,{sha:treeSha,truncated:false,tree:entries});
   return {row,readmeSource,commit,tree};
 }
+
+test('RST package labels and headings preserve purpose without publishing directives, commands or code',()=>{
+  const metadata=source('https://api.github.com/public-lab/mock',{private:false}),row=item('https://github.com/public-lab/mock','Mock',metadata);
+  const body='Mocker\n======\n\n.. image:: https://example.org/badge.svg\n    :target: https://example.org/\n\nA utility library for mocking the ``httpclient`` Python library.\n\n.. note::\n    PRIVATE_DIRECTIVE_CONTENT\n\nInstalling\n----------\n``pip install mocker``\n\nBasics\n------\nRegister expected responses for an HTTP request.\n\n.. code-block:: python\n\n    PRIVATE_CODE_CALL()\n\nUse ``runCommand()`` to run PRIVATE_EXPRESSION.\n\nDeprecations and Migration Path\n------------------------------\nRead older API migration notes.\n';
+  const retained=readme('public-lab/mock',body),result=enrichCatalogueDetails({items:[row],evidence:[retained]})[0];
+  assert.equal(result.details.overview,'A utility library for mocking the httpclient Python library.');
+  assert.ok(result.details.sections.some(s=>s.title==='Basics'&&s.summary.includes('Register expected responses')));
+  assert.ok(!JSON.stringify(result.details).includes('PRIVATE_'));assert.ok(!JSON.stringify(result.details).includes('pip install'));
+  assert.ok(result.citations.some(c=>c.sha256===retained.sha256));assert.equal(publicCatalogueSchema.shape.items.element.safeParse(result).success,true);
+});
+
+test('subject-purpose statements outrank maintenance questions, award notices and permission why sections',()=>{
+  const metadata=source('https://api.github.com/repos/public-lab/utility',{private:false}),row=item('https://github.com/public-lab/utility','Utility',metadata);
+  for(const [body,purpose] of [
+    ['Is Utility an active project?\nUtility is a volunteer-run project. Its application is no longer actively maintained.\nRepo Note: The main branch is an in development version.\n# Utility\nUtility helps you extract tables from PDF files.\n## Limitations\nOnly text-based documents are supported.','Utility helps you extract tables from PDF files.'],
+    ['## Graph for commits\nA browser extension that displays a repository commit graph.\n## Why does it need write access\nThe extension asks for permission in the level.','A browser extension that displays a repository commit graph.'],
+    ['# Learn\nOur repository is the Winner of a contest!\n## What this is\nA tutorial for building small language interpreters.','A tutorial for building small language interpreters.'],
+    ['# Utility\nWelcome to the utility repository!\nThis collection provides examples and tutorials for a separate cloud runtime.\n## Features\nSamples demonstrate the runtime capabilities.','This collection provides examples and tutorials for a separate cloud runtime.']
+  ]){
+    const details=enrichCatalogueDetails({items:[row],evidence:[readme('public-lab/utility',body)]})[0].details;
+    assert.equal(details.overview,purpose);const text=[details.overview,...(details.features||[]),...(details.sections||[]).flatMap(s=>[s.title,s.summary])].join(' ');assert.ok(text.split(/\s+/).length<=180);
+  }
+});
+
+test('multiple H1 sections do not turn release timelines or installation prerequisites into the product overview',()=>{
+  const metadata=source('https://api.github.com/repos/public-lab/lessons',{private:false}),row=item('https://github.com/public-lab/lessons','Lessons',metadata);
+  const body='# Lessons\nOur repo. is the Winner of a contest!\nTimeline:\n- Oct. 1, 2019: Stable release!\n# Installation\nMake sure you have the required Python runtime.\n# Includes\n- Linear regression worked examples.\n- Neural network training examples.\n';
+  const result=enrichCatalogueDetails({items:[row],evidence:[readme('public-lab/lessons',body)]})[0];
+  assert.equal(result.details.overview,undefined);assert.ok(result.details.sections.some(s=>s.title==='Includes'&&s.summary.includes('regression')));assert.ok(!JSON.stringify(result.details).includes('Winner'));
+});
+
+test('RST relative indentation excludes directive bodies and keeps following public prose',()=>{
+  const metadata=source('https://api.github.com/repos/public-lab/rst',{private:false}),row=item('https://github.com/public-lab/rst','RST',metadata);
+  for(const indent of [' ','   ','    ','\t']){
+    const body='RST\n===\n\n.. code-block:: text\n\n'+indent+'A database platform called PRIVATE_DIRECTIVE provides example text.\n'+indent+':option: PRIVATE_OPTION\n\nAn HTTP mock library for repeatable tests.\n\nBasics\n------\nRecord expected requests for a test.';
+    const details=enrichCatalogueDetails({items:[row],evidence:[readme('public-lab/rst',body)]})[0].details;
+    assert.equal(details.overview,'An HTTP mock library for repeatable tests.');assert.ok(!JSON.stringify(details).includes('PRIVATE_'));
+  }
+});
+
+test('action-oriented product intro beats a dependency definition and access-management can be a real purpose heading',()=>{
+  const metadata=source('https://api.github.com/repos/public-lab/vault',{private:false}),row=item('https://github.com/public-lab/vault','Vault',metadata),purpose='Encrypt and rotate team credentials with audited workflows.';
+  const first=enrichCatalogueDetails({items:[row],evidence:[readme('public-lab/vault','# Vault\n'+purpose+'\n## Architecture\nRedis is an in-memory database used by our queue.')]})[0].details;
+  assert.equal(first.overview,purpose);
+  const second=enrichCatalogueDetails({items:[row],evidence:[readme('public-lab/vault','## Access management\nAn access management platform for teams.\n## Why does it need access\nThe application requires administrator permission.')]})[0].details;
+  assert.equal(second.overview,'An access management platform for teams.');
+});
+
+test('text-only HTML formatting can supply purpose while executable HTML and attributes remain excluded',()=>{
+  const metadata=source('https://api.github.com/repos/public-lab/runtime',{private:false}),row=item('https://github.com/public-lab/runtime','Runtime',metadata);
+  const body='<p align="center">\n\t<strong>Java application development framework for team services.</strong>\n</p>\n<script>PRIVATE_SCRIPT</script>\n<style>PRIVATE_STYLE</style>\n<p onclick="PRIVATE_ATTRIBUTE">A supporting library for application teams.</p>\n<p><img src="PRIVATE_IMAGE">PRIVATE_IMAGE_CAPTION</p>\n<iframe>PRIVATE_IFRAME</iframe>\n<strong>npm install PRIVATE_COMMAND</strong>\n## Features\n- A documented public capability.';
+  const result=enrichCatalogueDetails({items:[row],evidence:[readme('public-lab/runtime',body)]})[0];
+  assert.equal(result.details.overview,'Java application development framework for team services.');assert.ok(!JSON.stringify(result.details).includes('PRIVATE_'));assert.equal(publicCatalogueSchema.shape.items.element.safeParse(result).success,true);
+  for(const quote of ['"',"'"]){const quoted=`<p data-note=${quote}hidden > A library for ATTRIBUTEBODYSENTINEL.${quote}>Encrypt and rotate team credentials with audited workflows.</p>`;
+    const details=enrichCatalogueDetails({items:[row],evidence:[readme('public-lab/runtime',quoted)]})[0].details;
+    assert.equal(details.overview,'Encrypt and rotate team credentials with audited workflows.');assert.ok(!JSON.stringify(details).includes('ATTRIBUTEBODYSENTINEL'));
+  }
+});
+
+test('Chinese reference scope requires a teaching declaration rather than names, notebook support or a note-management product',()=>{
+  const metadata=source('https://api.github.com/repos/public-lab/guide',{private:false}),row=item('https://github.com/public-lab/guide','学习笔记指南',metadata);
+  for(const [description,body,expected] of [
+    ['Reference material','# Study\n「编程面试小抄」一份通向开发工作的面试指南。','reference'],
+    ['Reference material','# Study\n本仓库提供计算机课程笔记，帮助读者学习基础知识。','reference'],
+    ['算法学习方法 [笔记, 代码, notebook, 参考文献, Errata]','# Study\n本书已经出第二版。','reference'],
+    ['A productivity application.','# App\n一个学习笔记管理工具。','tool'],
+    ['A productivity application.','# App\n本项目是一个教程发布系统。','tool'],
+    ['A productivity application.','# App\n一个面试指南生成平台。','tool'],
+    ['A notebook server.','# App\n本仓库是一个支持学习笔记和教程的协作平台。','tool'],
+    ['A database application.','# App\n请阅读学习指南了解安装方法。','tool'],
+    ['A visual editor.','# App\nA visual editor with tutorial examples.','tool'],
+  ]){const result=enrichCatalogueDetails({items:[{...row,description}],evidence:[readme('public-lab/guide',body)]})[0];assert.equal(result.details.resourceType,expected,body);assert.equal(result.description,description);}
+});
 test('documentation scope requires exact README blob, pinned commit/tree linkage and overwhelming docs without implementation root',()=>{
   const input=docsScopeFixture(),output=enrichCatalogueDetails({items:[input.row],evidence:[input.readmeSource,input.commit,input.tree]})[0];
   assert.equal(output.details.resourceType,'reference');assert.ok(output.citations.some(ref=>ref.sha256===input.tree.sha256));

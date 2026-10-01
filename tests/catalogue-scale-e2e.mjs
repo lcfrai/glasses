@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import packageInfo from '../package.json' with {type:'json'};
 import {mkdtemp,mkdir,rm,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
@@ -9,7 +10,7 @@ import {startServer} from '../src/server.mjs';
 const directory=await mkdtemp(join(tmpdir(),'glasses-scale-ui-'));
 const evidence=resolve(process.env.GLASSES_EVIDENCE_DIR||'evidence/catalogue-growth-2026-09-28/browser-scale');await mkdir(evidence,{recursive:true});
 const report={startedAt:new Date().toISOString(),result:'RUNNING',checks:[],limitations:['150 synthetic public candidates exercise real HTTP, SQLite, assessment filtering and browser rendering in an isolated server.','No real provider requests, credentials, main application data or settings are used.']};
-let app,browser,page,token;const errors=[],navigationTrace=[];
+let app,browser,page,token;const errors=[],navigationTrace=[],catalogueResponses=[],responseReads=[];
 const providers={plan:async()=>{throw new Error('Unexpected scale-test planning')},rank:async()=>{throw new Error('Unexpected scale-test ranking')},status:async()=>({codex:{available:true,authenticated:true,model:'scale-fixture'},jev:{configured:false,model:'jev-1.13.0'}}),classify:async(provider,{cards})=>({model:'scale-fixture',results:cards.map(card=>({id:card.id,artifact:'tool-library',adoption:'embed-package',capabilities:['synthetic scale'],confidence:.9,evidenceIds:card.evidenceIds})),usage:{inputTokens:1,outputTokens:1}})};
 async function api(path,method='GET',body){const response=await fetch(app.url+path,{method,headers:{'X-Glasses-Token':token,'Content-Type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})});const data=await response.json();assert.ok(response.ok,path+' '+response.status+' '+JSON.stringify(data));return data;}
 async function until(fn){const end=Date.now()+15000;while(Date.now()<end){const result=await fn();if(result)return result;await delay(50)}throw new Error('Expected state did not appear');}
@@ -42,9 +43,9 @@ try{
   const job=app.intelligence.enqueue({type:'classify',candidateIds:[candidates[149].id]});await until(()=>app.intelligence.getJob(job.id).status==='completed');
   browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH?{executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH}:{})});report.browserVersion=browser.version();page=await browser.newPage({viewport:{width:1440,height:1000}});page.on('pageerror',error=>errors.push(error.message));
   await page.addInitScript(()=>{window.scaleNavigationEvents=[];for(const type of ['pointerdown','pointerup','click'])document.addEventListener(type,event=>{const button=event.target.closest?.('.catalogue-pagination button');if(button)window.scaleNavigationEvents.push({type,time:performance.now(),text:button.textContent,disabled:button.disabled,busy:document.querySelector('.catalogue-list')?.getAttribute('aria-busy'),range:document.querySelector('.catalogue-pagination span')?.textContent})},true)});
-  page.on('response',response=>{if(new URL(response.url()).pathname==='/api/catalog')navigationTrace.push({type:'response',url:response.url(),status:response.status(),at:new Date().toISOString()})});await page.goto(app.url+'/#catalogue');
+  page.on('response',response=>{if(new URL(response.url()).pathname==='/api/catalog'){navigationTrace.push({type:'response',url:response.url(),status:response.status(),at:new Date().toISOString()});responseReads.push((async()=>{try{const raw=await response.text(),value=JSON.parse(raw);catalogueResponses.push({url:response.url(),status:response.status(),bytes:Buffer.byteLength(raw),returned:value.items?.length,total:value.total,offset:value.offset});}catch{/* An obsolete response can be cancelled after its headers. */}})());}});await page.goto(app.url+'/#catalogue');
   await check('A large catalogue renders 60 cards per page and visits every result exactly once',async()=>{
-    const all=await api('/api/catalog');report.total=all.total;await expectResultCount(all.total);await until(async()=>await cards().count()===60);const seen=[];
+    await page.getByText('LOCAL / v'+packageInfo.version,{exact:false}).waitFor();const all=await api('/api/catalog');report.total=all.total;await expectResultCount(all.total);await until(async()=>await cards().count()===60);const seen=[];
     for(let index=0;index<Math.ceil(all.total/60);index++){await settled();seen.push(...await names());if(index+1<Math.ceil(all.total/60)){const first=(await names())[0];await next().click();await until(async()=>(await names())[0]!==first)}}
     assert.equal(await next().isDisabled(),true);assert.deepEqual([...seen].sort(),all.items.map(item=>item.name).sort());assert.equal(new Set(seen).size,seen.length);await expectResultCount(all.total);
     await page.screenshot({path:join(evidence,'last-page.png'),fullPage:true,animations:'disabled'});
@@ -66,13 +67,26 @@ try{
       await page.mouse.up();await until(async()=>(await navigationState()).range==='61–120 of 161');
       releaseCatalogue();await settled();const after=await navigationState();assert.equal(after.range,'61–120 of 161','The returned item array must preserve the user-selected page');
       report.backgroundRefresh={before,during,after};
-      await next().click();await until(async()=>(await navigationState()).range==='121–161 of 161');
+      await next().click();await until(async()=>(await navigationState()).range==='121–161 of 161');await settled();
     }finally{releaseStatus();releaseCatalogue();await page.mouse.up();await page.unroute('**/api/status',statusRoute);await page.unroute('**/api/catalog?*',catalogueRoute);}
   });
   await check('Page changes preserve inspection and search resets to its first page',async()=>{
     const selected=(await names())[0];await page.getByRole('button',{name:'Inspect '+selected,exact:true}).click();await previous().click();assert.equal(await page.locator('.detail-name').textContent(),selected);
     await search().fill('001');await until(async()=>await cards().count()===1);assert.deepEqual(await names(),['Scale fixture 001']);assert.equal(await next().count(),0);
     await search().fill('');await until(async()=>await cards().count()===60);assert.equal(await previous().isDisabled(),true);
+  });
+  await check('Origin filtering uses server totals and always starts at the first bounded page',async()=>{
+    for(const origin of ['live','seed','sample','shared','all']){
+      const expected=await api('/api/catalog?origin='+origin),response=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/catalog'&&new URL(r.url()).searchParams.get('origin')===origin);
+      await page.getByRole('combobox',{name:'Catalogue origin'}).selectOption(origin);await response;await expectResultCount(expected.total);assert.deepEqual(await names(),expected.items.slice(0,60).map(row=>row.name));if(expected.total>60)assert.equal(await previous().isDisabled(),true);
+    }
+  });
+  await check('A failed page is retryable and a superseded delayed query cannot replace current results',async()=>{
+    let fail=true;await page.route('**/api/catalog?*',route=>{const url=new URL(route.request().url());if(url.searchParams.get('q')==='001'&&fail){fail=false;return route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Synthetic temporary page failure'})});}return route.continue();});
+    await search().fill('001');await page.getByRole('heading',{name:'Could not load this page.',exact:true}).waitFor();await page.getByRole('button',{name:'Retry catalogue',exact:true}).click();await until(async()=>(await names()).join()==='Scale fixture 001');await settled();await page.unroute('**/api/catalog?*');
+    let release,started=false;const gate=new Promise(resolve=>release=resolve);await page.route('**/api/catalog?*',async route=>{if(new URL(route.request().url()).searchParams.get('q')!=='002')return route.continue();const response=await route.fetch();started=true;await gate;await route.fulfill({response}).catch(()=>{});});
+    try{await search().fill('002');await until(()=>started);await search().fill('003');await until(async()=>(await names()).join()==='Scale fixture 003');release();await delay(100);assert.deepEqual(await names(),['Scale fixture 003']);}finally{release();await page.unroute('**/api/catalog?*');}
+    await search().fill('');await expectResultCount(report.total);await page.getByRole('button',{name:'Dismiss error',exact:true}).click();
   });
   await check('Every assessment status filters correctly and low-confidence inference does not grant licence rights',async()=>{
     for(const status of ['unclassified','classified','needs-review','stale','corrected']){const expected=await api('/api/catalog?assessmentStatus='+status);await chooseStatus(status);await expectResultCount(expected.total);assert.equal(await cards().count(),Math.min(60,expected.total));assert.deepEqual(await names(),expected.items.slice(0,60).map(item=>item.name));}
@@ -96,6 +110,9 @@ try{
       const responsive=await browser.newPage({viewport});responsive.on('pageerror',error=>errors.push(error.message));await responsive.goto(app.url+'/#catalogue');await responsive.getByRole('searchbox',{name:'Search catalogue'}).waitFor();await until(async()=>await responsive.locator('button.capability-card').count()===60);assert.equal(await responsive.getByRole('combobox',{name:'Catalogue assessment status'}).isVisible(),true);await responsive.getByRole('button',{name:'Next results',exact:true}).click();const suffix=viewport.width<800?'mobile':'short-desktop';await responsive.screenshot({path:join(evidence,'catalogue-'+suffix+'.png'),fullPage:true,animations:'disabled'});await responsive.locator('button.capability-card').first().scrollIntoViewIfNeeded();const cardBox=await responsive.locator('button.capability-card').first().boundingBox();assert.ok(cardBox&&cardBox.height>100&&cardBox.y>=(viewport.width<800?140:70)&&cardBox.y+cardBox.height<=viewport.height-24,JSON.stringify(cardBox));await responsive.screenshot({path:join(evidence,'catalogue-'+suffix+'-cards.png'),fullPage:true,animations:'disabled'});const size=await responsive.evaluate(()=>({width:document.documentElement.scrollWidth,viewport:innerWidth}));assert.ok(size.width<=size.viewport+2,JSON.stringify(size));await responsive.close();
     }
     assert.deepEqual(errors,[]);
+  });
+  await check('Browser catalogue requests and responses remain bounded throughout every flow',async()=>{
+    await Promise.all(responseReads);assert.ok(catalogueResponses.length>10);for(const row of catalogueResponses){const url=new URL(row.url);assert.equal(url.searchParams.get('limit'),'60');assert.ok(Number(url.searchParams.get('offset'))<=100000);if(row.status===200){assert.ok(row.returned<=60);assert.ok(row.bytes<512000);}}report.catalogueResponses=catalogueResponses;report.maxCatalogueResponseBytes=Math.max(...catalogueResponses.map(row=>row.bytes));
   });
   report.result='PASS';
 }catch(error){report.result='FAIL';report.error=error.stack;if(page){report.failureState=await navigationState().catch(()=>null);await page.screenshot({path:join(evidence,'failure.png'),fullPage:true,animations:'disabled'}).catch(()=>{});}console.error(error);process.exitCode=1;}finally{report.navigationTrace=navigationTrace;report.finishedAt=new Date().toISOString();await writeFile(join(evidence,'report.json'),JSON.stringify(report,null,2));await browser?.close();await app?.close();await rm(directory,{recursive:true,force:true});}

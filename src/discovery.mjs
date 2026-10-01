@@ -6,7 +6,9 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { licenseInfo, stableId, searchTerms } from './store.mjs';
 import { githubRepositoryKind } from './github-kind.mjs';
 import { detectFramework, frameworkTags } from './framework.mjs';
-import { MAX_RAW_README_BYTES, rawReadmeDeclaration, verifyRawReadme } from './github-readme.mjs';
+import { registryComponentIdentity, registryIndexItemURL } from './classification-policy.mjs';
+import { officialRegistryFrameworkProof } from './registry-framework-evidence.mjs';
+import { MAX_RAW_README_BYTES, base64ReadmeVerified, rawReadmeDeclaration, verifyRawReadme } from './github-readme.mjs';
 
 const stamp = () => new Date().toISOString();
 const small = (s,n=4000) => typeof s==='string'?s.slice(0,n):'';
@@ -216,7 +218,7 @@ export function markdownSourceFiles(body){
   return files.filter(file=>file.content.length<=150000).slice(0,40);
 }
 
-function markdownDependencies(body,source) {
+export function markdownDependencies(body,source) {
   // Dependency declarations are evidence only. Never derive or fetch child URLs here.
   const metadata=body.includes('## Files')?body.slice(0,body.indexOf('## Files')):body.split(/^```/m)[0];
   const links=[],raw={};
@@ -244,11 +246,37 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
   backfillGitHubMetadata(store);
   let scouting=false;
   const requestContext=new AsyncLocalStorage();
+  const registryProofReads=new Map();
   const idleWaiters=new Set();
   const read=async(url,options={})=>{
     const signal=requestContext.getStore();signal?.throwIfAborted();validatePublicURL(url);
     let doc;try{doc=await fetcher(url,{...options,signal});}catch(error){if(error&&typeof error==='object')error.sourceUrl=url;throw error;}
     signal?.throwIfAborted();return {...doc,evidence:store.retainEvidence({...doc,url:doc.url||url})};
+  };
+  const proofRead=async url=>{
+    const cached=registryProofReads.get(url);if(cached&&Date.now()-cached.at<300000)return cached.promise;
+    if(registryProofReads.size>=8)registryProofReads.delete(registryProofReads.keys().next().value);
+    const promise=read(url);registryProofReads.set(url,{at:Date.now(),promise});
+    try{
+      const doc=await promise,bytes=Buffer.byteLength(doc.body),entry=registryProofReads.get(url);
+      if(entry?.promise===promise){
+        if(bytes>4*1024*1024)registryProofReads.delete(url);
+        else {entry.bytes=bytes;while([...registryProofReads.values()].reduce((sum,value)=>sum+(value.bytes||0),0)>16*1024*1024)registryProofReads.delete(registryProofReads.keys().next().value);}
+      }
+      return doc;
+    }catch(error){if(registryProofReads.get(url)?.promise===promise)registryProofReads.delete(url);throw error;}
+  };
+  const officialSourceProof=async(item,source)=>{
+    const identity=registryComponentIdentity(item.url);if(!identity||!item.metadataEvidence?.id)return null;
+    try{
+      const index=store.getEvidence(item.metadataEvidence.id);if(index?.sha256!==item.metadataEvidence.sha256)return null;
+      const directory=await proofRead('https://registry.directory/directory.json'),providers=asJSON(directory).registries;
+      const matches=Array.isArray(providers)?providers.filter(row=>typeof row.github_url==='string'&&row.github_url.replace(/\/$/,'').toLowerCase()===('https://github.com'+identity.basePath).toLowerCase()):[];
+      if(matches.length!==1||!publicHref(matches[0].registry_url))return null;
+      const registry=await proofRead(matches[0].registry_url);
+      const retained=doc=>({...doc,...doc.evidence});
+      return officialRegistryFrameworkProof({itemUrl:item.url,index,directory:retained(directory),registry:retained(registry),source:retained(source)})?{directory:directory.evidence,registry:registry.evidence}:null;
+    }catch{requestContext.getStore()?.throwIfAborted();return null;}
   };
   const failureState=error=>{
     // This aggregator turns any failed origin source fetch (including HTTP 401)
@@ -264,8 +292,17 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
     return store.upsertCapability({...item,sourceError:state.error,sourceState:state,sourceHistory:[...(item.sourceHistory||[]),state].slice(-20)}).item;
   };
   const saveSource=(item,doc,files,extra={},metadata=extra)=>{
-    const framework=detectFramework({...metadata,files});
-    const extraction=extractPreviewSource(files,metadata);
+    // Index declarations and fetched component source are independent evidence.
+    // Preserve a conflict as mixed, rather than silently replacing it with a
+    // framework inferred from just one of the documents.
+    let indexed={};
+    if(registryComponentIdentity(item.url)&&item.metadataEvidence?.id){
+      const retained=store.getEvidence(item.metadataEvidence.id);
+      if(retained?.url==='https://registry.directory/items.json'&&retained.sha256===item.metadataEvidence.sha256){try{const matches=JSON.parse(retained.body).items.filter(entry=>registryIndexItemURL(entry)===item.url);if(matches.length===1)indexed={...matches[0],tags:matches[0].categories};}catch{}}
+    }
+    const indexedFrameworks=detectFramework(indexed).frameworks;
+    const framework=detectFramework({...metadata,frameworks:[...indexedFrameworks,...(Array.isArray(metadata.frameworks)?metadata.frameworks:[])],files});
+    const extraction=extractPreviewSource(files,{...metadata,frameworks:framework.frameworks});
     const state={status:extraction.previewSource?'ok':'unsupported',checkedAt:stamp(),error:extraction.previewSource?null:'Fetched source files have no supported exported React component.',retainedPreviousSource:false};
     sourceStatus(`${item.name} source`,doc.url||item.url,state.error?new Error(state.error):null,files.length);
     const previous=store.getCapability(stableId(item.url));
@@ -286,7 +323,7 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
       try {
         const doc=await read(url),data=asJSON(doc);
         let content;
-        if(resource==='readme'&&data.encoding==='none'){
+        if(resource==='readme'&&(data.encoding==='none'||data.encoding==='base64'&&(data.size!==undefined||data.sha!==undefined)&&!base64ReadmeVerified(data))){
           const identity={repository:parts.join('/'),revision:commit.sha},declared=rawReadmeDeclaration(doc,identity);
           const raw=await read(declared.url,{maxBytes:MAX_RAW_README_BYTES,redirects:0});verifyRawReadme(raw,doc,identity);
           content=raw.body;evidence.push(doc.evidence,raw.evidence);
@@ -303,8 +340,8 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
         if(resource==='license'&&licence?.status==='fetched'&&licence.revision!==commit.sha)licence={status:'unverified-current-source',scope:'repository',previous:licence,revision:commit.sha,note:'Licence retrieval failed for this new revision. Prior licence evidence is retained but has not been verified for the current revision.'};
       }
     }
-    const state={status:errors.length?'partial':'ok',checkedAt:stamp(),errors};
-    return store.upsertCapability({...item,license:licence?.status==='unverified-current-source'?null:licence?.status==='fetched'?licence.spdx:item.license,licenseEvidence:licence,repositoryFiles:files,repositoryEvidence:[commitDoc.evidence,...evidence],repositoryReadmeProof,sourceState:state,sourceError:errors.length?errors.map(x=>`${x.resource}: ${x.error}`).join('; '):null,sourceHistory:[...(item.sourceHistory||[]),state].slice(-20),provenance:{...item.provenance,resolvedRevision:commit.sha,repositoryFetchedAt:stamp(),commitEvidenceId:commitDoc.evidence.id}}).item;
+    const state={status:errors.length?'partial':'ok',checkedAt:stamp(),errors,...(item.graphqlReadmeProof?{previousGraphqlReadmeProof:item.graphqlReadmeProof,previousEvidenceIds:(item.repositoryEvidence||[]).map(ref=>ref.id)}:{})};
+    return store.upsertCapability({...item,license:licence?.status==='unverified-current-source'?null:licence?.status==='fetched'?licence.spdx:item.license,licenseEvidence:licence,repositoryFiles:files,repositoryEvidence:[commitDoc.evidence,...evidence],repositoryReadmeProof,graphqlReadmeProof:null,sourceState:state,sourceError:errors.length?errors.map(x=>`${x.resource}: ${x.error}`).join('; '):null,sourceHistory:[...(item.sourceHistory||[]),state].slice(-20),provenance:{...item.provenance,resolvedRevision:commit.sha,repositoryFetchedAt:stamp(),commitEvidenceId:commitDoc.evidence.id}}).item;
   };
   const attachSource=async(item,{force=false}={})=>{
     let doc,files;
@@ -333,7 +370,8 @@ export function createDiscovery({store,fetcher=fetchPublic}={}) {
       doc=await read(item.sourceItemUrl);const data=asJSON(doc);
       const extracted=registrySourceFiles(data,30);files=extracted.files;
       if(!files.length)throw new Error('Source document has no supported source files; inspect the upstream item.');
-      return saveSource(item,doc,files,{sourceFileMetadata:extracted.sourceFileMetadata,dependencies:data.dependencies||[],peerDependencies:data.peerDependencies||{},framework:data.framework||null,frameworks:data.frameworks||[],registryDependencies:data.registryDependencies||[],...(item.url===(doc.url||item.sourceItemUrl)?{tags:['registry','imported',...frameworkTags(data)]}:{}),...(data.license?{...licenseInfo(data.license),licenseEvidence:{status:'metadata-only',scope:'registry-item',sourceUrl:doc.url||item.sourceItemUrl,spdx:data.license,evidenceId:doc.evidence.id}}:{})},data);
+      const registrySourceProof=await officialSourceProof(item,doc);
+      return saveSource(item,doc,files,{registrySourceProof,...(registryComponentIdentity(item.url)?{registrySourceProofState:{status:registrySourceProof?'verified':'unverified',checkedAt:stamp(),note:registrySourceProof?'Exact namespace, official registry entry and source file inventory verified.':'Official registry identity could not be verified. Fetched source remains available locally; its framework is not yet publication evidence.'}}:{}),sourceFileMetadata:extracted.sourceFileMetadata,dependencies:data.dependencies||[],peerDependencies:data.peerDependencies||{},framework:data.framework||null,frameworks:data.frameworks||[],registryDependencies:data.registryDependencies||[],...(item.url===(doc.url||item.sourceItemUrl)?{tags:['registry','imported',...frameworkTags(data)]}:{}),...(data.license?{...licenseInfo(data.license),licenseEvidence:{status:'metadata-only',scope:'registry-item',sourceUrl:doc.url||item.sourceItemUrl,spdx:data.license,evidenceId:doc.evidence.id}}:{})},data);
     }
     const match=item.url.match(/^https:\/\/registry\.directory\/([^/]+)\/([^/]+)\/([^/?#]+)\/?$/);
     if(match) {

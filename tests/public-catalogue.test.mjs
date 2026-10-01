@@ -9,6 +9,8 @@ import { createStore, stableId } from '../src/store.mjs';
 import { createIntelligenceStore } from '../src/intelligence-store.mjs';
 import { INTELLIGENCE_SCHEMA } from '../src/intelligence.mjs';
 import { CLASSIFICATION_POLICY, classificationFingerprint } from '../src/classification-policy.mjs';
+import { PUBLIC_SOURCE_EXCERPT_VERSION } from '../src/public-source-excerpt.mjs';
+import {repositoryReadmeRefs} from '../src/github-readme.mjs';
 import { createPublicCatalogue, validatePublicCatalogue, mergePublicCatalogues, withPublicCatalogueItems } from '../src/public-catalogue.mjs';
 import { readPublicCatalogueInputs, admitPublicGithubCandidates } from '../scripts/export-public-catalogue.mjs';
 import { startServer } from '../src/server.mjs';
@@ -23,8 +25,8 @@ function fixture({row=repo(),endpoint='https://api.github.com/repos/public-lab/m
   const snapshot=evidence(endpoint,endpoint.includes('/search/')?{items:[row]}:row,observedAt);
   const capability={id:stableId(row.html_url),url:row.html_url,name:row.full_name,description:row.description,kind:'solution',provider:'GitHub',tags:row.topics,origin:'live',metadataEvidence:{...snapshot,body:undefined},provenance:{sourceUrl:endpoint,revision:'branch:main',note:'PRIVATE_HISTORY_QUOTE',threadId:'PRIVATE_CHAT_ID'},outcomes:[{notes:'PRIVATE_OUTCOME',evidencePath:'F:\\Private\\test.json'}],workspaceId:'PRIVATE_WORKSPACE',privateNotes:'PRIVATE_NOTES'};
   const base={id:capability.id,name:capability.name,url:capability.url,description:capability.description,provider:capability.provider,sourceKind:capability.kind,tags:capability.tags};
-  const sourceFingerprint=sha(JSON.stringify({schema:INTELLIGENCE_SCHEMA,...base,evidenceIds:[snapshot.id],revision:'branch:main',sourceHash:null}));
-  const assessment={id:capability.id,classification:{artifact:'agent-extension',adoption:'configure-agent',capabilities:['durable recall'],confidence:0.88,evidenceIds:[snapshot.id]},provider:'jev',model:'jev-1.13.0',schemaVersion:INTELLIGENCE_SCHEMA,sourceFingerprint,updatedAt:time,jobId:'PRIVATE_JOB'};
+  const sourceFingerprint=classificationFingerprint({base,evidenceIds:[snapshot.id],revision:'branch:main',sourceHash:null});
+  const assessment={id:capability.id,classification:{artifact:'agent-extension',adoption:'configure-agent',capabilities:['durable recall'],confidence:0.88,evidenceIds:[snapshot.id]},provider:'jev',model:'jev-1.13.0',schemaVersion:INTELLIGENCE_SCHEMA,policyVersion:CLASSIFICATION_POLICY,sourceFingerprint,updatedAt:time,jobId:'PRIVATE_JOB'};
   return {capabilities:[capability],evidence:[snapshot],assessments:[assessment],generatedAt:time};
 }
 
@@ -92,7 +94,7 @@ test('case-insensitive assessment sources retain immutable-ref, endpoint and rep
     item.repositoryEvidence=[source];input.evidence.push(source);
     const refs=url.includes('/readme?')?[source.id,item.metadataEvidence.id]:[item.metadataEvidence.id,source.id];
     const base={id:item.id,name:item.name,url:item.url,description:item.description,provider:item.provider,sourceKind:item.kind,tags:item.tags};
-    input.assessments[0].sourceFingerprint=sha(JSON.stringify({schema:INTELLIGENCE_SCHEMA,...base,evidenceIds:refs,revision:'branch:main',sourceHash:null}));
+    input.assessments[0].sourceFingerprint=classificationFingerprint({base,evidenceIds:refs,revision:'branch:main',sourceHash:null,repositorySourceSelection:repositoryReadmeRefs(item).length?PUBLIC_SOURCE_EXCERPT_VERSION:null});
     input.assessments[0].classification.evidenceIds=[source.id];
     const projected=createPublicCatalogue(input).snapshot.items[0];
     assert.equal(Boolean(projected.assessment),accepted,url);
@@ -234,14 +236,14 @@ function purposeFixture({generatedAt=later,assessedAt=later,...options}={}){
   return input;
 }
 
-test('purpose-v3 projection accepts new adoption routes only with the policy-bound source fingerprint',()=>{
+test('current-purpose projection accepts adoption routes only with the policy-bound source fingerprint',()=>{
   const input=purposeFixture(),{snapshot,report}=createPublicCatalogue(input);
   assert.equal(report.assessmentOmitted,0);assert.equal(snapshot.items[0].assessment.adoption,'install-app');
   assert.deepEqual(snapshot.items[0].assessment.capabilities,['document-editing','office-productivity']);
   assert.equal(snapshot.items[0].assessment.schemaVersion,INTELLIGENCE_SCHEMA);
   assert.equal(snapshot.items[0].assessment.assessedAt,later);assert.equal(snapshot.items[0].observedAt,time);
   assert.ok(!JSON.stringify(snapshot).includes('policyVersion'),'Internal cache policy does not change the public wire schema');
-  for(const policy of [undefined,'unknown-policy']){
+  for(const policy of [undefined,'glasses-evidence-v2','glasses-purpose-v3','unknown-policy']){
     const stale=structuredClone(input);stale.assessments[0].policyVersion=policy;
     const result=createPublicCatalogue(stale);assert.equal(result.snapshot.items[0].assessment,null);assert.equal(result.report.assessmentOmitted,1);
   }

@@ -2,14 +2,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import { validatePublicCatalogue } from './public-catalogue.mjs';
 
 export const SHARED_CATALOGUE_URL = 'https://lcfr.ai/glasses/catalogue.json';
-export const CATALOGUE_MAX_BYTES = 32 * 1024 * 1024;
+export const CATALOGUE_MAX_BYTES = 192 * 1024 * 1024;
 const KEY = 'catalogueOnboardingV1';
 const failure = (message, status = 400) => Object.assign(new Error(message), { status });
 const stamp = () => new Date().toISOString();
 
 // A status read never fetches. Each import needs a new explicit action, including
 // after a previous failure or successful first-run consent. No model hook runs.
-export function createOnboarding({ store, fetchImpl = fetch, timeoutMs = 30000, maxBytes = CATALOGUE_MAX_BYTES } = {}) {
+export function createOnboarding({ store, fetchImpl = fetch, timeoutMs = 120000, maxBytes = CATALOGUE_MAX_BYTES } = {}) {
   const leaseKey = 'catalogueImportLeaseV1';
   let current = null, controller = null, closed = false;
   const saved = () => store.getSetting(KEY, { version: 1, choice: 'pending', decidedAt: null, lastAttempt: null, lastSuccess: null });
@@ -52,14 +52,14 @@ export function createOnboarding({ store, fetchImpl = fetch, timeoutMs = 30000, 
     if (!response.ok) { await cancelBody(); throw failure(`The shared catalogue returned HTTP ${response.status}. Your local catalogue was not changed.`, 502); }
     if (response.redirected || (response.url && response.url !== SHARED_CATALOGUE_URL)) { await cancelBody(); throw failure('The catalogue response changed URL; no import was made.', 502); }
     const length = Number(response.headers.get('content-length') || 0);
-    if (length > maxBytes) { await cancelBody(); throw failure('The shared catalogue exceeds the 32 MiB download limit.', 502); }
+    if (length > maxBytes) { await cancelBody(); throw failure('The shared catalogue exceeds its download size limit.', 502); }
     if (!response.body) throw failure('The shared catalogue response was empty.', 502);
     const reader = response.body.getReader(), chunks = []; let bytes = 0;
     try {
       while (true) {
         const { done, value } = await withDeadline(reader.read(), signal); if (done) break;
         bytes += value.byteLength;
-        if (bytes > maxBytes) throw failure('The shared catalogue exceeds the 32 MiB download limit.', 502);
+        if (bytes > maxBytes) throw failure('The shared catalogue exceeds its download size limit.', 502);
         chunks.push(Buffer.from(value));
       }
     } finally { await withDeadline(reader.cancel(), signal).catch(() => {}); reader.releaseLock(); }
@@ -88,7 +88,7 @@ export function createOnboarding({ store, fetchImpl = fetch, timeoutMs = 30000, 
       store.setSetting(KEY, { ...saved(), lastAttempt: completed, lastSuccess: completed });
       return status();
     } catch (error) {
-      const message = signal.aborted ? 'The catalogue download was cancelled or exceeded 30 seconds. Choose Import latest catalogue to retry.'
+      const message = signal.aborted ? 'The catalogue download was cancelled or exceeded its time limit. Choose Import latest catalogue to retry.'
         : error.status ? error.message : /public catalogue|public candidate|public citation|Assessment cites|licence metadata|Stars require/i.test(error.message) ? 'The shared catalogue failed strict validation. Your local catalogue was not changed.'
         : 'The shared catalogue could not be downloaded. Your local catalogue was not changed; retry when the connection is available.';
       store.setSetting(KEY, { ...saved(), lastAttempt: { ...attempt, status: 'failed', completedAt: stamp(), error: message } });

@@ -29,7 +29,8 @@ test('real local MCP creates and resumes a typed bulk plan; source bytes stay be
     assert.equal((await fetch(app.url+'/api/bulk-scans')).status,401);
     assert.equal((await request('/api/catalog?hasPreview=maybe','GET')).status,400);
     const settings=await (await request('/api/intelligence/settings','PUT',{maxJobsPerDay:200,jevDailyBudgetUsd:0})).json();assert.equal(settings.settings.maxJobsPerDay,200);assert.equal(settings.settings.jevDailyBudgetUsd,0);
-    assert.equal((await request('/api/intelligence/settings','PUT',{maxJobsPerDay:501})).status,400);
+    const upper=await (await request('/api/intelligence/settings','PUT',{maxJobsPerDay:5000})).json();assert.equal(upper.settings.maxJobsPerDay,5000);assert.equal(upper.settings.jevDailyBudgetUsd,0);
+    assert.equal((await request('/api/intelligence/settings','PUT',{maxJobsPerDay:5001})).status,400);
     const page=await fetch(app.url+'/');assert.match(page.headers.get('content-security-policy'),/img-src 'self' data: https:\/\/lcfr\.ai\/glasses\/previews\//);assert.doesNotMatch(page.headers.get('content-security-policy'),/img-src[^;]*https:;/);
   }finally{await client?.close();await app?.close();await rm(directory,{recursive:true,force:true});}
 });

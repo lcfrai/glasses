@@ -11,6 +11,7 @@ import {createIntelligenceStore} from '../src/intelligence-store.mjs';
 import {createPublicCatalogue,publicCatalogueEvidenceIds} from '../src/public-catalogue.mjs';
 import {enrichCatalogueDetails} from '../src/catalogue-details.mjs';
 import {MAX_RAW_README_BYTES,rawReadmeIdentity,rawReadmeDeclaration,verifyRawReadme,repositoryReadmeRefs} from '../src/github-readme.mjs';
+import {selectPublicSourceExcerpt} from '../src/public-source-excerpt.mjs';
 
 const hash=value=>createHash('sha256').update(value).digest('hex');
 const blob=value=>createHash('sha1').update(Buffer.concat([Buffer.from(`blob ${Buffer.byteLength(value)}\0`),Buffer.from(value)])).digest('hex');
@@ -90,6 +91,27 @@ test('ordinary base64 README keeps its original reference ordering and no raw re
   assert.deepEqual(repositoryReadmeRefs(item),item.repositoryEvidence.filter(ref=>/\/readme(?:\?|$)/i.test(ref.url||'')).map(ref=>ref.id));
 });
 
+test('truncated base64 from GitHub recovers only exact pinned raw bytes and retains the original mismatch',async t=>{
+  const data=await fixture(t,documents=>{const url=`${endpoint}/readme?ref=${revision}`,old=JSON.parse(documents.get(url).body);documents.set(url,document(url,JSON.stringify({...old,encoding:'base64',content:Buffer.from(largeBody.slice(0,512000)).toString('base64')})));});
+  const item=await data.discovery.inspect(data.imported.id,{fetchSource:true});
+  assert.equal(item.sourceState.status,'ok');assert.equal(item.repositoryFiles.find(x=>x.path==='README.md').content,largeBody);
+  assert.equal(item.repositoryReadmeProof.gitBlobSha,blob(largeBody));assert.equal(data.requests.at(-1).url,rawUrl);
+  assert.equal(JSON.parse(data.store.getEvidence(item.repositoryReadmeProof.apiEvidence.id).body).encoding,'base64');
+  assert.deepEqual(repositoryReadmeRefs(item),[item.repositoryReadmeProof.rawEvidence.id]);
+});
+
+test('truncated inline bytes never survive a failed exact raw recovery',async t=>{
+  const data=await fixture(t,documents=>{const url=`${endpoint}/readme?ref=${revision}`,old=JSON.parse(documents.get(url).body);documents.set(url,document(url,JSON.stringify({...old,encoding:'base64',content:Buffer.from('partial').toString('base64')})));documents.set(rawUrl,document(rawUrl,largeBody+'tamper','text/plain'));});
+  const item=await data.discovery.inspect(data.imported.id,{fetchSource:true});
+  assert.equal(item.sourceState.status,'partial');assert.equal(item.repositoryReadmeProof,null);assert.ok(!item.repositoryFiles.some(x=>x.path==='README.md'));
+  assert.match(item.sourceError,/bytes do not match/);
+});
+
+test('a valid declared base64 body needs no second source request',async t=>{
+  const body='A complete source body.',data=await fixture(t,documents=>{const url=`${endpoint}/readme?ref=${revision}`;documents.set(url,document(url,JSON.stringify({encoding:'base64',path:'README.md',content:Buffer.from(body).toString('base64'),size:Buffer.byteLength(body),sha:blob(body),download_url:rawUrl})));});
+  const item=await data.discovery.inspect(data.imported.id,{fetchSource:true});assert.equal(item.sourceState.status,'ok');assert.equal(item.repositoryReadmeProof,null);assert.equal(data.requests.length,4);assert.equal(item.repositoryFiles.find(x=>x.path==='README.md').content,body);
+});
+
 test('classifier consumes raw prose; strict public labels and bounded details cite the original full-body hash',async t=>{
   const {directory,store,discovery,imported}=await fixture(t),item=await discovery.inspect(imported.id,{fetchSource:true}),calls=[];
   const providers={status:async()=>({jev:{configured:true,model:'jev-1.13.0'}}),plan:async()=>{},rank:async()=>{},classify:async(provider,{cards})=>{calls.push(cards);return {model:'jev-1.13.0',usage:{inputTokens:100,outputTokens:10},results:cards.map(card=>({id:card.id,artifact:'whole-product',adoption:'deploy-service',capabilities:['document search'],confidence:0.8,evidenceIds:card.evidenceIds}))};}};
@@ -99,12 +121,18 @@ test('classifier consumes raw prose; strict public labels and bounded details ci
     for(let i=0;i<400;i++){completed=engine.getJob(job.id);if(!['queued','running'].includes(completed.status))break;await new Promise(r=>setTimeout(r,10));}
     assert.equal(completed.status,'completed',JSON.stringify(completed.errors));
     assert.equal(calls.length,1);assert.equal(calls[0][0].evidence[0].url,rawUrl);
-    assert.match(calls[0][0].evidence[0].excerpt,/public document search application/);assert.ok(calls[0][0].evidence[0].excerpt.length<=2000);
-    assert.doesNotMatch(calls[0][0].evidence[0].excerpt,/encoding.*none|TAIL_SENTINEL/);
+    const sent=calls[0][0].evidence[0],selected=selectPublicSourceExcerpt(largeBody);
+    assert.match(sent.excerpt,/public document search application/);assert.ok(Buffer.byteLength(sent.excerpt,'utf8')<=6500);
+    assert.equal(sent.excerpt,selected.text);assert.equal(sent.sha256,hash(largeBody));
+    assert.doesNotMatch(sent.excerpt,/encoding.*none|retained padding/);
+    // Source selection may reach a later public paragraph. That does not make
+    // the full retained README, or this tail marker, public catalogue content.
+    assert.ok(selected.selected.every(row=>Number.isInteger(row.startLine)&&row.endLine>=row.startLine));
   }finally{await engine.close();}
   const intelligence=createIntelligenceStore(directory);let assessment;try{assessment=intelligence.get('assessments',item.id);}finally{intelligence.close();}
   const evidence=publicCatalogueEvidenceIds([item]).map(id=>store.getEvidence(id)),input={capabilities:[item],evidence,assessments:[assessment]};
   const result=createPublicCatalogue(input);assert.equal(result.snapshot.items.length,1);assert.ok(result.snapshot.items[0].assessment);
+  assert.doesNotMatch(JSON.stringify(result.snapshot),/TAIL_SENTINEL|retained padding/);
   const enriched=enrichCatalogueDetails({items:result.snapshot.items,evidence})[0];
   const prose=JSON.stringify(enriched.details);assert.match(prose,/public document search application/);assert.doesNotMatch(prose,/TAIL_SENTINEL/);
   const rawCitation=enriched.citations.find(x=>x.endpoint===rawUrl);assert.equal(rawCitation.sha256,hash(largeBody));assert.equal(rawCitation.kind,'github-source-evidence');

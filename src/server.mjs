@@ -87,6 +87,12 @@ export async function startServer({port=Number(process.env.GLASSES_PORT||4317),d
         const supplied=String(req.headers['x-glasses-token']||'');
         if(supplied.length!==token.length||!timingSafeEqual(Buffer.from(supplied),Buffer.from(token)))throw fail('Missing or invalid X-Glasses-Token; obtain /api/session on loopback',401);
         if(path==='/api/catalog'&&req.method==='GET') {
+          const limitParam=url.searchParams.get('limit'),offsetParam=url.searchParams.get('offset');
+          const paged=limitParam!==null||offsetParam!==null,limit=limitParam===null?50:Number(limitParam);let offset=offsetParam===null?0:Number(offsetParam);
+          if(paged&&(!/^\d+$/.test(limitParam??'50')||!/^\d+$/.test(offsetParam??'0')||!Number.isSafeInteger(limit)||limit<1||limit>100||!Number.isSafeInteger(offset)||offset<0||offset>100000))throw fail('limit must be 1–100 and offset must be 0–100000');
+          const originFilter=url.searchParams.get('origin')||'all',revealId=url.searchParams.get('revealId');
+          if(!['all','live','seed','sample','shared'].includes(originFilter))throw fail('Unsupported catalogue origin');
+          if(revealId!==null&&!/^[a-f0-9]{20}$/.test(revealId))throw fail('Invalid reveal candidate identity');
           const hasPreview=url.searchParams.get('hasPreview');if(hasPreview!==null&&!['true','false'].includes(hasPreview))throw fail('hasPreview must be true or false');
           const kind=url.searchParams.get('kind')||'all';if(kind!=='all'&&!KINDS.includes(kind))throw fail('Unknown capability kind');
           const query=(url.searchParams.get('q')||'').slice(0,500),runId=url.searchParams.get('runId'),parentId=url.searchParams.get('parentId');const resourceType=url.searchParams.get('resourceType')||'all';if(resourceType!=='all'&&!RESOURCE_TYPES.includes(resourceType))throw fail('Unsupported resourceType');if(parentId&&!store.getCapability(parentId))throw fail('Collection parent not found',404);
@@ -96,7 +102,14 @@ export async function startServer({port=Number(process.env.GLASSES_PORT||4317),d
           const jobIds=job?new Set(job.candidateIds||[]):null;
           const assessmentStatus=url.searchParams.get('assessmentStatus')||'all';
           if(!['all','unclassified','classified','needs-review','stale','corrected'].includes(assessmentStatus))throw fail('Unknown assessment status');
-          const items=intelligence.decorate(store.search({kind,openSourceOnly:url.searchParams.get('openSourceOnly')==='true'}),{query,artifact:url.searchParams.get('artifact')||'all'}).filter(item=>(hasPreview!=='true'||!!item.details?.preview)&&(resourceType==='all'||resourceTypeOf(item)===resourceType)&&(!parentId||item.details?.parent?.id===parentId)&&(!ids||ids.has(item.id))&&(!jobIds||jobIds.has(item.id))&&(assessmentStatus==='all'||item.assessment?.status===assessmentStatus));send(res,200,{items,total:items.length,...(run?{run}:{}),...(job?{job}:{})});return;
+          const items=intelligence.decorate(store.search({kind,openSourceOnly:url.searchParams.get('openSourceOnly')==='true'}),{query,artifact:url.searchParams.get('artifact')||'all'}).filter(item=>(hasPreview!=='true'||!!item.details?.preview)&&(originFilter==='all'||item.origin===originFilter)&&(resourceType==='all'||resourceTypeOf(item)===resourceType)&&(!parentId||item.details?.parent?.id===parentId)&&(!ids||ids.has(item.id))&&(!jobIds||jobIds.has(item.id))&&(assessmentStatus==='all'||item.assessment?.status===assessmentStatus));
+          if(job?.type==='rank'&&job.result?.rankings){const scores=new Map(job.result.rankings.map(row=>[row.id,row.score]));items.sort((a,b)=>(scores.get(b.id)??-1)-(scores.get(a.id)??-1)||a.name.localeCompare(b.name));}
+          if(paged&&revealId){const index=items.findIndex(row=>row.id===revealId);if(index>=0)offset=Math.floor(index/limit)*limit;}
+          // Paged consumers already know the filter identity. Do not retransmit a
+          // whole scan's membership or model rankings with every bounded page.
+          const runInfo=paged&&run?{id:run.id,status:run.status,candidateCount:run.candidateIds?.length||0}:run;
+          const jobInfo=paged&&job?{id:job.id,type:job.type,status:job.status,candidateCount:job.candidateIds?.length||0}:job;
+          send(res,200,{items:paged?items.slice(offset,offset+limit):items,total:items.length,...(paged?{offset,limit,nextOffset:offset+limit<items.length?offset+limit:null}:{}),...(runInfo?{run:runInfo}:{}),...(jobInfo?{job:jobInfo}:{})});return;
         }
         if(path==='/api/onboarding'&&req.method==='GET'){send(res,200,{onboarding:onboarding.status()});return;}
         if(path==='/api/intelligence'&&req.method==='GET'){send(res,200,await intelligenceStatus());return;}

@@ -1,14 +1,21 @@
 import {chromium} from 'playwright';
 import assert from 'node:assert/strict';
-import {mkdtemp,readFile,mkdir,writeFile,rm,realpath} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,rm,realpath} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {startServer} from '../src/server.mjs';
+import {readPublicCatalogueFile} from '../src/public-catalogue-file.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const dir=path.resolve(root,process.env.GLASSES_EVIDENCE_DIR||'evidence/site-onboarding-2026-09-29/onboarding-browser');await mkdir(dir,{recursive:true});
 const tempRoot=await realpath(tmpdir()),dataDir=await mkdtemp(path.join(tempRoot,'glasses-consent-ui-'));
-const raw=await readFile(path.join(root,'catalogue/catalogue.json'),'utf8').catch(()=>readFile(path.join(root,'public-site/public/glasses/catalogue.json'),'utf8')),pack=JSON.parse(raw);
+let pack;
+for(const source of process.env.GLASSES_TEST_CATALOGUE_PATH?[process.env.GLASSES_TEST_CATALOGUE_PATH]:['catalogue/catalogue.json.gz','catalogue/catalogue.json','public-site/public/glasses/catalogue.json']){
+ try{pack=await readPublicCatalogueFile(path.join(root,source));break;}
+ catch(error){if(error.code!=='ENOENT')throw error;}
+}
+if(!pack)throw Error('No bundled public catalogue fixture is available');
+const raw=JSON.stringify(pack);
 let calls=0,failNext=false,app,browser,page,token;const errors=[];
 const report={at:new Date().toISOString(),scope:'Isolated database and synthetic HTTP transport for the exact retained public pack. No external catalogue/model requests.',checks:[]};
 const providers={status:async()=>({}),classify:async()=>{throw Error('Inference forbidden');},plan:async()=>{throw Error('Inference forbidden');},rank:async()=>{throw Error('Inference forbidden');}};

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { createStore } from '../src/store.mjs';
 import { createIntelligence, INTELLIGENCE_SCHEMA } from '../src/intelligence.mjs';
 import { createIntelligenceStore } from '../src/intelligence-store.mjs';
@@ -52,6 +53,97 @@ async function setup(t,{providers=fakeProviders(),discovery={}}={}) {
   t.after(async()=>{await engine.close();store.close();});return {directory,store,engine,providers};
 }
 async function done(engine,job){for(let count=0;count<400;count++){const current=engine.getJob(job.id);if(!['queued','running'].includes(current.status))return current;await delay(10);}throw new Error('Job did not settle');}
+
+test('explicit MCP classification reads only the requested catalogue membership',async t=>{
+  const {store,engine}=await setup(t);const chosen=candidate(store,'Chosen'),outside=candidate(store,'Outside');
+  store.search=()=>{throw Error('Full catalogue scan is forbidden for this bounded explicit batch');};
+  const job=await done(engine,engine.enqueue({type:'classify',candidateIds:[chosen.id]}));
+  assert.equal(job.status,'completed');assert.deepEqual(job.result.assessmentIds,[chosen.id]);assert.equal(engine.getAssessment(outside.id).status,'unclassified');
+});
+
+test('search assessment snapshots retain correction and source freshness without rereading each capability',async t=>{
+  const {store,engine,providers}=await setup(t),item=candidate(store,'Current Search Evidence');
+  engine.submitAssessment(item.id,{artifact:'tool-library',adoption:'embed-package',capabilities:['search indexing'],confidence:0.9,evidenceIds:[item.metadataEvidence.id]});
+  const compare=()=>{
+    const expected=engine.getAssessment(item.id),items=store.search({query:''}),getSummary=store.getCapabilitySummary;
+    let reads=0;store.getCapabilitySummary=id=>{reads++;return getSummary(id);};
+    try{const actual=engine.decorate(items).find(row=>row.id===item.id).assessment;assert.deepEqual(actual,expected);assert.equal(reads,0);return actual;}
+    finally{store.getCapabilitySummary=getSummary;}
+  };
+  assert.equal(compare().status,'classified');
+  engine.correctAssessment(item.id,{artifact:'whole-product',notes:'Synthetic reviewed scope'});
+  assert.equal(compare().status,'corrected');
+  store.upsertCapability({...store.getCapability(item.id),description:'New source purpose observed after classification.'});
+  const refreshed=compare();assert.equal(refreshed.status,'stale');assert.equal(refreshed.humanCorrected,true);assert.equal(refreshed.correction.notes,'Synthetic reviewed scope');
+  assert.equal(providers.calls.length,0);
+});
+
+test('catalogue assessment batches stay bounded and observe independent committed updates',async t=>{
+  const {directory,store,engine,providers}=await setup(t);
+  const items=Array.from({length:40},(_,i)=>candidate(store,'Bulk search '+i));
+  for(const item of items.slice(0,3))engine.submitAssessment(item.id,{artifact:'tool-library',adoption:'embed-package',capabilities:['search indexing'],confidence:0.9,evidenceIds:[item.metadataEvidence.id]});
+  engine.correctAssessment(items[1].id,{artifact:'whole-product',notes:'Human scope wins'});
+  engine.correctAssessment(items[2].id,{artifact:'whole-product',notes:'Keep this even when stale'});
+  store.upsertCapability({...items[2],description:'Changed retained source metadata'});
+  const check=()=>{
+    const input=store.search(),expected=new Map(input.map(item=>[item.id,engine.getAssessment(item.id)]));
+    const queries=[],prepare=DatabaseSync.prototype.prepare;
+    const spy=t.mock.method(DatabaseSync.prototype,'prepare',function(sql,...args){
+      if(/\b(?:assessments|corrections)\b/.test(sql))queries.push(sql);
+      return prepare.call(this,sql,...args);
+    });
+    let actual;
+    try{actual=engine.decorate(input);}finally{spy.mock.restore();}
+    assert.equal(actual.length,40);
+    for(const item of actual)assert.deepEqual(item.assessment,expected.get(item.id));
+    assert.deepEqual(queries.sort(),['SELECT data FROM assessments','SELECT data FROM corrections'],'Two table reads, independent of candidate count; no per-row lookups');
+    return new Map(actual.map(item=>[item.id,item.assessment]));
+  };
+  const before=check();
+  assert.equal(before.get(items[0].id).status,'classified');
+  assert.equal(before.get(items[1].id).status,'corrected');
+  assert.equal(before.get(items[2].id).status,'stale');
+  assert.equal(before.get(items[2].id).correction.notes,'Keep this even when stale');
+  assert.equal(before.get(items[3].id).status,'unclassified');
+  const independent=createIntelligenceStore(directory);
+  try{
+    const prior=independent.get('assessments',items[0].id);
+    independent.save('assessments',{...prior,classification:{...prior.classification,artifact:'whole-product'},updatedAt:'2026-10-01T00:00:00.000Z'});
+    independent.save('corrections',{id:items[1].id,patch:{artifact:'reference',notes:'Updated independently'},updatedAt:'2026-10-01T00:00:01.000Z'});
+    const untouched=before.get(items[3].id);
+    independent.save('assessments',{...prior,id:items[3].id,sourceFingerprint:untouched.currentFingerprint,classification:{...prior.classification,id:items[3].id,evidenceIds:[items[3].metadataEvidence.id]}});
+  }finally{independent.close();}
+  const after=check();
+  assert.equal(after.get(items[0].id).artifact,'whole-product');
+  assert.equal(after.get(items[1].id).artifact,'reference');
+  assert.equal(after.get(items[1].id).correction.notes,'Updated independently');
+  assert.equal(after.get(items[3].id).status,'classified','A previously missing row must not remain cached');
+  assert.equal(providers.calls.length,0);
+});
+
+test('parallel Jev classification reserves before sending and settles in-flight usage before terminal status',async t=>{
+  const starts=[],base=fakeProviders();let inFlight=0,peak=0;
+  const providers=fakeProviders({classify:async(provider,input)=>{starts.push(Date.now());inFlight++;peak=Math.max(peak,inFlight);await delay(1550);try{return await base.classify(provider,input);}finally{inFlight--;}}});
+  const {store,engine}=await setup(t,{providers});
+  const ids=Array.from({length:12},(_,i)=>candidate(store,'Parallel '+i).id);
+  engine.updateSettings({provider:'jev',maxCandidates:30,jevConcurrency:4,jevDailyBudgetUsd:0.006});
+  const job=await done(engine,engine.enqueue({type:'classify',candidateIds:ids}));
+  assert.equal(job.status,'partial');assert.match(job.errors.join(' '),/budget/);
+  assert.equal(starts.length,2,'Only two conservative reservations fit while requests are in flight');assert.equal(peak,2);assert.equal(inFlight,0);
+  assert.ok(starts[1]-starts[0]>=350,'Concurrent starts stay paced');
+  assert.equal(job.usage.length,2);assert.ok(job.usage.every(row=>row.status==='completed'));assert.ok(job.result.assessmentIds.length>0);
+  assert.ok(Math.abs((await engine.status()).usageToday.jevReservedUsd-0.0000084)<1e-12);
+});
+
+test('indexed usage summary preserves UTC boundaries, uncertain costs and rejected-call accounting',async()=>{
+  const directory=await temporary(),database=createIntelligenceStore(directory);
+  try{
+    for(const row of [{id:'before',createdAt:'2026-09-30T23:59:59.999Z',provider:'jev',costUsd:1,chargedOrReservedUsd:1},{id:'at',createdAt:'2026-10-01T00:00:00.000Z',provider:'jev',inputTokens:100,costUsd:0.1,chargedOrReservedUsd:0.1},{id:'unknown',createdAt:'2026-10-01T12:00:00.000Z',provider:'jev',costUsd:null,chargedOrReservedUsd:0.002688},{id:'rejected',createdAt:'2026-10-01T13:00:00.000Z',provider:'jev',requestSent:false,costUsd:0,chargedOrReservedUsd:0},{id:'after',createdAt:'2026-10-02T00:00:00.000Z',provider:'jev',costUsd:2,chargedOrReservedUsd:2}])database.save('usage',row);
+    database.save('jobs',{id:'today',createdAt:'2026-10-01T00:00:00.000Z'});database.save('jobs',{id:'tomorrow',createdAt:'2026-10-02T00:00:00.000Z'});
+    assert.deepEqual(database.usageSummary('2026-10-01'),{calls:2,localRejections:1,inputTokens:100,outputTokens:0,jevCostUsd:0.1,jevReservedUsd:0.102688,unknownCostCalls:1,jobs:1});
+    assert.throws(()=>database.usageSummary('invalid'),/Invalid usage day/);
+  }finally{database.close();}
+});
 
 test('classification sends only bounded public evidence, preserves rights and retrieves inferred capabilities',async t=>{
   const {store,engine,providers}=await setup(t),item=candidate(store);

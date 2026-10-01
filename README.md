@@ -4,7 +4,7 @@ Find existing software before rebuilding it. Glasses gives coding agents a searc
 
 [Browse the public catalogue](https://lcfr.ai/glasses). The catalogue is a versioned public snapshot; research and private project work run on your own machine.
 
-Release **0.3.3** improves source descriptions: documented purpose and functions come before setup instructions, explicit feature tables are retained, and navigation/fundraising text is filtered. Registry frameworks are derived from source evidence instead of assuming every registry component uses React. Bulk discovery remains resumable across tools, components, skills, agents, collections and references. Dated source previews appear in card thumbnails, a **Has preview** filter and direct item links. These captures are documentation examples, not executable demos or compatibility tests.
+Release **0.3.4** supports large shared snapshots, paginated hosted browsing, and evidence-based framework and functional-control matching. Repository research retains exact metadata plus README text pinned to a Git commit and verified blob. Source descriptions prioritize documented purpose and functions. Bulk discovery remains resumable across tools, components, skills, agents, collections and references. Dated source previews appear in card thumbnails, a **Has preview** filter and direct item links. These captures are documentation examples, not executable demos or compatibility tests.
 
 Search also gives more weight to source-documented spreadsheet and threat-modelling purposes, so generic browser or model terminology is less likely to dominate those requests. This is discovery ranking, not a compatibility guarantee.
 
@@ -12,9 +12,13 @@ Search also gives more weight to source-documented spreadsheet and threat-modell
 
 Requires Node.js 24 or later and npm. The local interface binds to `127.0.0.1:4317`.
 
-This README describes source release **0.3.3**. The setup command requires this version's `scripts/setup.mjs`; a public checkout still on 0.3.0 needs the manual commands below. There is no published `npx` installer.
+This README describes source release **0.3.4**. The setup command requires this version's `scripts/setup.mjs`; a public checkout still on 0.3.0 needs the manual commands below. There is no published `npx` installer.
 
 **Upgrading from 0.3.0 or 0.3.1:** update the client before importing the new snapshot. Version 0.3.0 does not recognize expanded adoption routes such as `install-app`, `run-cli` and `use-hosted`; version 0.3.1 does not support the new public-page evidence. Keep your existing `.glasses` data directory when replacing source files, then run `npm ci` and `npm run build`. Local notes, workspaces and human corrections remain separate from shared metadata.
+
+**Upgrading from 0.3.2 or 0.3.3:** update before fetching snapshots larger than 32 MiB. Version 0.3.4 validates up to 192 MiB and 100,000 items without relaxing individual-record or evidence checks. Its bundled offline snapshot is compressed; explicit online sync still downloads JSON. Catalogue sync does not run models or execute upstream code.
+
+Version 0.3.4 also versions the README excerpt and classification rules used for local assessments. Labels from older rules or changed source evidence show as stale until reclassified. Your human corrections remain separate, and importing the shared snapshot does not submit paid classification jobs.
 
 Version 0.3.2 also binds registry evidence to the exact provider and item URL, fixing collisions between identically named components. Existing local registry assessments are marked stale until explicitly reclassified; the update itself does not make model calls. Whole-tool classification caches are unchanged by this registry-specific correction. Shared assessments remain attributed snapshot observations, separate from your local cache.
 
@@ -25,7 +29,7 @@ node scripts/setup.mjs
 npm start
 ```
 
-For the downloaded 0.3.3 source package, extract it and run the final two commands in its folder. Setup installs this repository's locked dependencies if they are missing, builds the local interface and asks **“Fetch latest catalogue now? [y/N]”**. Yes fetches `https://lcfr.ai/glasses/catalogue.json`; No saves your choice and leaves Glasses usable. A noninteractive terminal without an explicit flag leaves the choice pending and makes no catalogue request. Setup does not start a server or register an agent automatically.
+For the downloaded 0.3.4 source package, extract it and run the final two commands in its folder. Setup installs this repository's locked dependencies if they are missing, builds the local interface and asks **“Fetch latest catalogue now? [y/N]”**. Yes fetches `https://lcfr.ai/glasses/catalogue.json`; No saves your choice and leaves Glasses usable. A noninteractive terminal without an explicit flag leaves the choice pending and makes no catalogue request. Setup does not start a server or register an agent automatically.
 
 Open <http://127.0.0.1:4317>. If setup has not recorded a choice, the local app offers the same Yes/No choice. No shared catalogue is fetched until you approve it. Use **Shared catalogue** in the app to import later or retry, or run:
 
@@ -34,7 +38,7 @@ npm run catalogue:fetch
 npm run catalogue:status
 ```
 
-Each fetch command is an explicit one-time import; consent does not enable automatic shared updates. The download is bounded to 32 MiB and 30 seconds and must pass strict schema, citation, identity and content-hash checks before import. A failed request preserves existing data and remains visible for an explicit retry. Repeating an import preserves local sources, notes, workspaces and corrections and merges newer shared metadata. Imported shared observations remain separate from local verification.
+Each fetch command is an explicit one-time import; consent does not enable automatic shared updates. The download is bounded to 192 MiB and 120 seconds and must pass strict schema, citation, identity and content-hash checks before import. A failed request preserves existing data and remains visible for an explicit retry. Repeating an import preserves local sources, notes, workspaces and corrections and merges newer shared metadata. Imported shared observations remain separate from local verification.
 
 For scripted setup, `node scripts/setup.mjs --catalogue=import` or `--catalogue=decline` records an explicit choice. `--data-dir DIRECTORY` uses an isolated data directory. To use that same custom directory when starting the server, set `GLASSES_DATA_DIR`; without it the app uses `.glasses` beside this checkout.
 
@@ -46,7 +50,7 @@ npm run build
 npm start
 ```
 
-The bundled snapshot can also be imported offline with `npm run catalogue:import`. To import another downloaded public snapshot without a network request or model call:
+The bundled `catalogue/catalogue.json.gz` snapshot can also be imported offline with `npm run catalogue:import`. Its decompressed size and contents are checked before import. To import another downloaded public snapshot without a network request or model call (plain JSON and gzip are supported):
 
 ```sh
 node scripts/export-public-catalogue.mjs --import path/to/catalogue.json --data-dir .glasses
@@ -66,13 +70,15 @@ Tools cover compact search, source inspection, public import and research, adopt
 
 Search accepts `resourceType: "tool"`, `"component"`, `"skill"`, `"agent"`, `"collection"` or `"reference"`, and `hasPreview: true` selects entries with recorded previews. Inspect a collection and pass its `parentId` to search its individual members. Cards expose source-backed features, use cases, keywords and dependencies where documented. References identify useful documentation or public pages; they are not presented as installed software.
 
-In the public catalogue, use **Browse 59 source previews** or **Has preview**, then open a card to see its dated capture and original documentation link. **Copy catalogue link** creates a `/glasses?item=ID` link that reopens the same entry; browser back and forward follow those selections. Uncaptured entries retain an explicit source-link fallback. Preview availability is partial, and the preview filter uses free catalogue browsing rather than a paid ranking request.
+In the public catalogue, use **Browse source previews** or **Has preview**, then open a card to see its dated capture and original documentation link. The page shows the current preview count. **Copy catalogue link** creates a `/glasses?item=ID` link that reopens the same entry; browser back and forward follow those selections. Uncaptured entries retain an explicit source-link fallback. Preview availability is partial, and the preview filter uses free catalogue browsing rather than a paid ranking request.
 
 Skills and agent profiles have pinned source links and reviewed download bundles with original files, hashes and licence notices. The local `glasses_inspect` can retrieve a pinned guidance document and verify its published hash. These files remain untrusted source data: Glasses never installs or activates their instructions automatically, and distribution does not establish compatibility with your agent.
 
 ## Research and model connections
 
 Add a source from the catalogue, or create and amend a research plan in Research. GitHub discovery prioritizes popular results within a relevant query, with paging and archived/fork exclusions by default. Stars indicate popularity, not security, compatibility or suitability.
+
+The shared snapshot's [coverage receipt](https://lcfr.ai/glasses/coverage.json) separately records its broader GitHub census, including forks and archived repositories. Check its dates, snapshot hash and source-research counts. Catalogue entries, verified README sources and model assessments are different counts; an unassessed entry can still have useful source-backed descriptions. Function tags are suggestions, not an exhaustive list of what a project does.
 
 ### Bulk discovery
 

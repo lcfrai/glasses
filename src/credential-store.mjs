@@ -58,20 +58,23 @@ function dpapi(action, value) {
   });
 }
 
-export function createCredentialStore({ dataDir, platform = process.platform, protect = dpapi } = {}) {
+export function createCredentialStore({ dataDir, platform = process.platform, protect = dpapi, now = () => performance.now() } = {}) {
   if (!dataDir) throw new TypeError('dataDir is required');
   const directory = join(resolve(dataDir), 'credentials');
   const file = join(directory, 'jev.dpapi.json');
   const storage = platform === 'win32' ? 'windows-dpapi' : 'session-only';
-  let sessionKey = null, mutation = Promise.resolve(), cachedStatus, statusAt = 0;
+  // One short-lived value, never persisted. Reading the exact protected file on
+  // every access keeps external rotation/removal authoritative over this cache.
+  const CACHE_MS = 30000, retry = Symbol('credential changed');
+  let sessionKey = null, mutation = Promise.resolve(), cachedKey = null, cacheTimer = null, decrypting = null, generation = 0;
+  const clearCache = () => { cachedKey = null; clearTimeout(cacheTimer); cacheTimer = null; };
+  const invalidate = () => { clearCache(); generation++; };
   const serial = operation => {
     const result = mutation.then(operation, operation);
     mutation = result.catch(() => {});
     return result;
   };
-  async function load() {
-    await mutation;
-    if (storage === 'session-only') return sessionKey;
+  async function readCiphertext() {
     let raw;
     try { raw = await readFile(file, 'utf8'); }
     catch (error) {
@@ -82,24 +85,74 @@ export function createCredentialStore({ dataDir, platform = process.platform, pr
       if (raw.length > 32768) throw new Error();
       const record = JSON.parse(raw);
       if (record.version !== 1 || record.storage !== storage || typeof record.ciphertext !== 'string' || !/^[A-Za-z0-9+/=]+$/u.test(record.ciphertext)) throw new Error();
-      return validateKey(await protect('unprotect', record.ciphertext));
+      return record.ciphertext;
     } catch {
       throw credentialError('CREDENTIAL_STORAGE', 'Cannot unlock the Jev key for this Windows user. Re-enter the key.');
     }
   }
+  async function load() {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await mutation;
+      if (storage === 'session-only') return sessionKey;
+      const beforeRead = generation;
+      let ciphertext;
+      try { ciphertext = await readCiphertext(); }
+      catch (error) { invalidate(); throw error; }
+      if (beforeRead !== generation) continue;
+      if (ciphertext === null) {
+        clearCache();
+        if (decrypting?.generation === generation) generation++;
+        return null;
+      }
+      if (cachedKey && cachedKey.ciphertext !== ciphertext) invalidate();
+      const stamp = now();
+      if (cachedKey && Number.isFinite(stamp) && stamp >= cachedKey.at && stamp - cachedKey.at < CACHE_MS) return cachedKey.key;
+      clearCache();
+      if (decrypting && decrypting.ciphertext !== ciphertext) {
+        // At most one unprotect operation, even during external replacements.
+        invalidate(); await decrypting.promise.catch(() => {}); continue;
+      }
+      if (!decrypting) {
+        const pending = { ciphertext, generation, promise: null };
+        pending.promise = Promise.resolve().then(async () => {
+          try {
+            const key = validateKey(await protect('unprotect', ciphertext));
+            await mutation;
+            const current = await readCiphertext();
+            if (pending.generation !== generation) return retry;
+            if (current !== ciphertext) { invalidate(); return retry; }
+            const at = now();
+            if (Number.isFinite(at)) {
+              const entry = { ciphertext, key, at }; cachedKey = entry;
+              cacheTimer = setTimeout(() => { if (cachedKey === entry) clearCache(); }, CACHE_MS);
+              cacheTimer.unref?.();
+            }
+            return key;
+          } catch {
+            if (pending.generation !== generation) return retry;
+            clearCache();
+            throw credentialError('CREDENTIAL_STORAGE', 'Cannot unlock the Jev key for this Windows user. Re-enter the key.');
+          } finally { if (decrypting === pending) decrypting = null; }
+        });
+        decrypting = pending;
+      }
+      const pending = decrypting, key = await pending.promise;
+      if (key !== retry && pending.generation === generation) return key;
+    }
+    throw credentialError('CREDENTIAL_STORAGE', 'Cannot unlock the Jev key for this Windows user. Re-enter the key.');
+  }
   return {
-    async status({ force = false } = {}) {
-      if (!force && cachedStatus && Date.now() - statusAt < 30000) return { ...cachedStatus };
-      try { cachedStatus = { configured: Boolean(await load()), storage }; }
-      catch { cachedStatus = { configured: false, storage, error: 'Cannot unlock the saved Jev key. Re-enter the key.' }; }
-      statusAt = Date.now();
-      return { ...cachedStatus };
+    async status() {
+      // A failed decrypt is not configuration state. Do not cache a transient
+      // failure, or hide an externally replaced/removed file behind status TTL.
+      try { return { configured: Boolean(await load()), storage }; }
+      catch { return { configured: false, storage, error: 'Cannot unlock the saved Jev key. Re-enter the key.' }; }
     },
     load,
     async save(value) {
       const key = validateKey(value);
+      invalidate();
       await serial(async () => {
-        cachedStatus = undefined;
         if (storage === 'session-only') { sessionKey = key; return; }
         let temporary;
         try {
@@ -117,8 +170,8 @@ export function createCredentialStore({ dataDir, platform = process.platform, pr
       return this.status();
     },
     async remove() {
+      invalidate();
       await serial(async () => {
-        cachedStatus = undefined;
         sessionKey = null;
         try { await rm(file, { force: true }); }
         catch { throw credentialError('CREDENTIAL_STORAGE', 'Could not remove the protected Jev key.'); }

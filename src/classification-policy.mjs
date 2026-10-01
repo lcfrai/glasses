@@ -1,9 +1,11 @@
 import { createHash } from 'node:crypto';
+import { PUBLIC_SOURCE_EXCERPT_VERSION } from './public-source-excerpt.mjs';
 
 // Wire shape stays compatible. Policy versions describe the evidence semantics.
 export const CLASSIFICATION_SCHEMA = 'glasses-evidence-v2';
 export const LEGACY_CLASSIFICATION_POLICY = 'glasses-evidence-v2';
-export const CLASSIFICATION_POLICY = 'glasses-purpose-v3';
+export const PREVIOUS_CLASSIFICATION_POLICY = 'glasses-purpose-v3';
+export const CLASSIFICATION_POLICY = 'glasses-purpose-v4';
 export const REGISTRY_COMPONENT_SOURCE_SELECTION = 'registry-component-exact-url-v1';
 
 // A component's provider namespace is part of its identity. A bare name is
@@ -24,8 +26,9 @@ export function registryComponentIdentity(value) {
 // supply the same bounded public base and ordered evidence IDs, never private
 // outcomes/corrections. Non-registry legacy inputs keep their original hash
 // algorithm; registry children intentionally invalidate pre-identity excerpts.
-export function classificationFingerprint({ base, evidenceIds, revision = null, sourceHash = null, policy = CLASSIFICATION_POLICY }) {
-  if (![LEGACY_CLASSIFICATION_POLICY, CLASSIFICATION_POLICY].includes(policy)) throw new Error('Unknown classification policy');
-  const input = { schema: CLASSIFICATION_SCHEMA, ...(policy === LEGACY_CLASSIFICATION_POLICY ? {} : { policy }), ...(registryComponentIdentity(base?.url)?{sourceSelection:REGISTRY_COMPONENT_SOURCE_SELECTION}:{}), ...base, evidenceIds, revision, sourceHash };
+export function classificationFingerprint({ base, evidenceIds, revision = null, sourceHash = null, policy = CLASSIFICATION_POLICY, repositorySourceSelection = null }) {
+  if (![LEGACY_CLASSIFICATION_POLICY, PREVIOUS_CLASSIFICATION_POLICY, CLASSIFICATION_POLICY].includes(policy)) throw new Error('Unknown classification policy');
+  if(repositorySourceSelection!==null&&repositorySourceSelection!==PUBLIC_SOURCE_EXCERPT_VERSION)throw new Error('Unknown repository source selection');
+  const input = { schema: CLASSIFICATION_SCHEMA, ...(policy === LEGACY_CLASSIFICATION_POLICY ? {} : { policy }), ...(registryComponentIdentity(base?.url)?{sourceSelection:REGISTRY_COMPONENT_SOURCE_SELECTION}:{}), ...(repositorySourceSelection?{repositorySourceSelection}:{}), ...base, evidenceIds, revision, sourceHash };
   return createHash('sha256').update(JSON.stringify(input)).digest('hex');
 }

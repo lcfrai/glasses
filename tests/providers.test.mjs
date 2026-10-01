@@ -104,11 +104,12 @@ test('both classifiers retain only bounded public tags and generic collection/so
     assert.doesNotMatch(JSON.stringify(projected), /DO_NOT_SEND/);
   }
   assert.deepEqual(codexCards[0].tags, jevBody.state.cards[0].tags);
-  assert.match(jevBody.questions.a0.criteria['tool-library'], /collection overview/);
+  assert.match(jevBody.questions.a0.criteria['tool-library'], /implemented UI component library/);
+  assert.match(jevBody.questions.a0.criteria['tool-library'], /directory of external products/);
   assert.match(jevBody.questions.a0.criteria.component, /not a library\/collection/);
   assert.match(jevBody.questions.d0.criteria['embed-package'], /registry source item alone does not establish/);
   assert.match(jevBody.questions.d0.criteria['adapt-source'], /source-distribution registry/);
-  assert.match(codexPrompt, /collection overview/);
+  assert.match(codexPrompt, /implemented UI component library/);
 });
 
 test('Jev ranks thirty Unicode-rich cards in one bounded request and preserves IDs, scores and measured usage', async t => {
@@ -170,6 +171,38 @@ test('upstream HTTP/network errors never reflect the key or upstream body', asyn
     mode = value;
     await assert.rejects(providers.test('jev'), error => !error.message.includes(fixtureKey) && !error.stack.includes(fixtureKey));
   }
+});
+
+test('Jev request errors expose only fixed diagnostic categories', async t => {
+  const { providers } = await setup(t, { fetchImpl: async () => new Response(JSON.stringify({ error: `Maximum questions limit exceeded. secret=${fixtureKey}` }), { status: 400 }) });
+  await providers.saveJevKey(fixtureKey);
+  await assert.rejects(providers.classify('jev', { cards }), error => {
+    assert.equal(error.code, 'JEV_HTTP_400');
+    assert.deepEqual(error.diagnostics, { reason: 'question-limit' });
+    assert.ok(!JSON.stringify(error).includes(fixtureKey));
+    assert.ok(!error.message.includes('Maximum questions'));
+    return true;
+  });
+});
+
+test('public source excerpts remain valid Unicode at emoji truncation boundaries', async t => {
+  let sent;
+  const { providers } = await setup(t, { fetchImpl: async (_, init) => {
+    sent = JSON.parse(init.body);
+    return json(jevReply(sent));
+  } });
+  await providers.saveJevKey(fixtureKey);
+  const truncated = 'x'.repeat(1999) + '\uD83C';
+  const input = [{ ...cards[0], name: 'x'.repeat(299) + '🦘', tags: ['x'.repeat(99) + '🌿'],
+    evidence: [{ ...cards[0].evidence[0], excerpt: truncated }] }];
+  await providers.classify('jev', { cards: input });
+  const visit = value => {
+    if (typeof value === 'string') assert.ok(value.isWellFormed());
+    else if (value && typeof value === 'object') Object.values(value).forEach(visit);
+  };
+  visit(sent);
+  assert.equal(sent.state.cards[0].evidence[0].excerpt, 'x'.repeat(1999));
+  assert.equal(input[0].evidence[0].excerpt, truncated, 'Original retained source is never changed');
 });
 
 test('timeout and cancellation propagate an abort to an in-flight upstream fetch', async t => {

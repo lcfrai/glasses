@@ -8,6 +8,7 @@ import { startServer } from '../src/server.mjs';
 import { stableId } from '../src/store.mjs';
 import { createPublicCatalogue } from '../src/public-catalogue.mjs';
 import { INTELLIGENCE_SCHEMA } from '../src/intelligence.mjs';
+import { CLASSIFICATION_POLICY, classificationFingerprint } from '../src/classification-policy.mjs';
 
 const output=resolve(process.env.GLASSES_EVIDENCE_DIR||'evidence/public-launch-2026-09-29/shared-browser');await mkdir(output,{recursive:true});
 const directory=await mkdtemp(join(tmpdir(),'glasses-shared-browser-')),time='2026-09-29T00:00:00.000Z';
@@ -21,8 +22,9 @@ try{
   const repoEvidence=evidence('https://api.github.com/repos/public-lab/memory',repo),buttonURL='https://widgets.example.org/r/button.json',buttonData={name:'button',description:'A source-backed button',files:[{path:'button.tsx',content:'export default function Button(){return <button>Fetched on demand</button>}'}]},buttonEvidence=evidence(buttonURL,buttonData);
   const item={id:stableId(repo.html_url),url:repo.html_url,name:repo.full_name,description:repo.description,provider:'GitHub',kind:'solution',tags:repo.topics,origin:'live',metadataEvidence:repoEvidence,provenance:{revision:'branch:main'}};
   const base={id:item.id,name:item.name,url:item.url,description:item.description,provider:item.provider,sourceKind:item.kind,tags:item.tags};
-  const classification={id:item.id,provider:'jev',model:'jev-1.13.0',schemaVersion:INTELLIGENCE_SCHEMA,sourceFingerprint:sha(JSON.stringify({schema:INTELLIGENCE_SCHEMA,...base,evidenceIds:[repoEvidence.id],revision:'branch:main',sourceHash:null})),updatedAt:time,classification:{artifact:'agent-extension',adoption:'configure-agent',capabilities:['durable recall'],confidence:0.88,evidenceIds:[repoEvidence.id]}};
+  const classification={id:item.id,provider:'jev',model:'jev-1.13.0',schemaVersion:INTELLIGENCE_SCHEMA,policyVersion:CLASSIFICATION_POLICY,sourceFingerprint:classificationFingerprint({base,evidenceIds:[repoEvidence.id],revision:'branch:main',sourceHash:null}),updatedAt:time,classification:{artifact:'agent-extension',adoption:'configure-agent',capabilities:['durable recall'],confidence:0.88,evidenceIds:[repoEvidence.id]}};
   const pack=createPublicCatalogue({capabilities:[item,{url:buttonURL,origin:'live',sourceDocumentEvidence:buttonEvidence}],evidence:[repoEvidence,buttonEvidence],assessments:[classification],generatedAt:time}).snapshot;
+  assert.equal(pack.items.find(row=>row.id===item.id).assessment?.provider,'jev','The current-policy fixture must survive strict projection before testing its UI');
   const unexpected=async()=>{inferenceCalls++;throw new Error('Unexpected model request');};
   app=await startServer({port:0,dataDir:directory,seed:false,autoScout:false,providers:{status:async()=>({}),classify:unexpected,plan:unexpected,rank:unexpected},discoveryFetcher:async url=>{externalRequests++;assert.equal(url,buttonURL);return {url,body:JSON.stringify(buttonData),contentType:'application/json',status:200};}});
   const local=app.store.upsertCapability({url:'https://local-example.org/kept',name:'Local record preserved',kind:'reference',origin:'live',description:'Synthetic local annotation'}).item;
